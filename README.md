@@ -22,9 +22,8 @@ Windows 文件管理器，Rust + [gpui](https://github.com/zed-industries/zed)�
 - 网络邻居（SMB 共享浏览）
 
 ## 下载
-![Uploading 图片.png…]()
 
-
+![screenshot](docs/screenshot.png)
 
 从 [Releases](../../releases) 下载 `FileFlow-vX.Y-win64.zip`，解压后双击 `FileFlow.exe`。
 
