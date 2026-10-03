@@ -186,6 +186,7 @@ actions!(
         NewTab,
         CloseTab,
         NewFolder,
+        NewTextFile,
         ToggleHidden,
         CycleFolders,
         CopyToOther,
@@ -206,6 +207,8 @@ actions!(
         PasteFiles,
         RenameSelected,
         DeleteSelected,
+        /// Shift+Del：直接永久删除（不进回收站、不可撤销）
+        PermanentDeleteSelected,
         Undo,
         NavigateUp,
         NavigateDown,
@@ -239,7 +242,10 @@ enum WatchCommand {
 enum ShellOperationKind {
     Copy,
     Move,
+    /// Delete：进回收站（可 Ctrl+Z 撤销）
     Delete,
+    /// PermanentDelete：Shift+Del 直接抹除，不进回收站、不可撤销
+    PermanentDelete,
 }
 
 /// Ctrl+Z 撤销记录：把 from 路径恢复为 to 路径（新建 = to 为 None）
@@ -261,6 +267,7 @@ impl ShellOperationKind {
             Self::Copy => "复制",
             Self::Move => "移动",
             Self::Delete => "移入回收站",
+            Self::PermanentDelete => "永久删除",
         }
     }
 }
@@ -444,9 +451,14 @@ struct FileFlowGpui {
     win_e_enabled: bool,
     /// 替换资源管理器：文件夹/驱动器默认打开方式改为 FileFlow
     explorer_replacement: bool,
+    /// 本次布局的窗口逻辑宽度（render 写入，列宽自适应读取）。
+    ///
+    /// 列宽计算发生在 uniform_list 的行构建闭包里，那个闭包拿不到 `&mut Window`，
+    /// 所以在 render 里先缓存窗口宽度，闭包再读。
+    last_pane_width: f32,
     new_folder_input: Entity<TextInput>,
     new_folder_open: bool,
-    new_folder_multiple: bool,
+    new_item_kind: NewItemKind,
     show_settings: bool,
     show_shortcuts: bool,
     left_preview_open: bool,
@@ -511,7 +523,11 @@ impl FileFlowGpui {
         let filter_input = cx.new(|cx| TextInput::new(cx, "输入名称筛选…"));
         let right_filter_input = cx.new(|cx| TextInput::new(cx, "输入名称筛选…"));
         let address_input = cx.new(|cx| TextInput::new(cx, "输入路径，例如 D:\\"));
-        let new_folder_input = cx.new(|cx| TextInput::new(cx, "新建文件夹"));
+        let new_folder_input = cx.new(|cx| {
+            let mut input = TextInput::new(cx, "每行一个名称");
+            input.set_multiline(true);
+            input
+        });
         let rename_input = cx.new(|cx| TextInput::new(cx, "新名称"));
         let batch_rename_input = cx.new(|cx| TextInput::new(cx, "批量名称（生成 名称_001、名称_002…）"));
         cx.observe(&filter_input, |this, _, cx| {
@@ -577,9 +593,10 @@ impl FileFlowGpui {
             load_thumbnails: saved.load_thumbnails,
             win_e_enabled: saved.win_e_enabled,
             explorer_replacement: saved.explorer_replacement,
+            last_pane_width: 1280.0,
             new_folder_input,
             new_folder_open: false,
-            new_folder_multiple: false,
+            new_item_kind: NewItemKind::Folder,
             show_settings: false,
             show_shortcuts: false,
             left_preview_open: false,
@@ -1072,6 +1089,59 @@ impl FileFlowGpui {
         } else {
             (self.left_sort_column, self.left_sort_ascending)
         }
+    }
+
+    /// Details 三列宽度 [类型, 日期, 大小]（逻辑像素）——**列宽单一来源**。
+    ///
+    /// 表头、数据行、空白单元格都消费这里返回值，保证三列 x 坐标恒定。
+    ///
+    /// 策略：**先给名称列留出最小宽度，剩余空间按内容占比分给三列**。
+    /// 原来是固定 112/158/90（只看是否分栏乘 0.55，不看窗口宽度），
+    /// 窗口一宽名称列就独吞全部剩余空间、三列显得局促。
+    ///
+    /// 占比按内容需要定：日期最占（完整时间戳 "2026/10/3 03:42"），
+    /// 类型次之（要放"文件夹 ▾"和筛选箭头），大小最小（"1.2 MB"）。
+    fn details_col_widths(&self) -> [f32; 3] {
+        /// 名称列左侧固定占用：缩进 30（图标位）+ 图标 15 + gap 12
+        const NAME_CHROME: f32 = 57.0;
+        /// 名称列必须保留的最小宽度（放得下常见中文文件名）
+        const NAME_MIN: f32 = 190.0;
+        /// 三列合计的最大占比（剩下的留给名称列，避免三列喧宾夺主）
+        const COL_MAX_RATIO: f32 = 0.52;
+        /// 三列之间共 2 个 12px 间隙
+        const GAPS: f32 = 24.0;
+
+        let pane = self.last_pane_width.max(280.0);
+        // 分栏时每侧只有一半宽
+        let pane = if self.split { pane * 0.5 } else { pane };
+
+        // 名称列的绝对底线：无论窗口多窄，三列都必须让出这么多，
+        // 否则窄窗口 + 分栏时三列会把名称挤到放不下一个字。
+        let col_total_max = (pane - NAME_CHROME - NAME_MIN - GAPS).max(96.0);
+        // 富余空间按占比分配
+        let col_budget = (col_total_max * COL_MAX_RATIO).max(96.0);
+        let total = col_budget - GAPS;
+
+        const SHARE_TYPE: f32 = 0.30;
+        const SHARE_DATE: f32 = 0.44;
+        const SHARE_SIZE: f32 = 0.26;
+        let type_w = (total * SHARE_TYPE).clamp(72.0, 260.0);
+        let date_w = (total * SHARE_DATE).clamp(96.0, 320.0);
+        let size_w = (total * SHARE_SIZE).clamp(64.0, 220.0);
+
+        // clamp 可能突破上限（极窄窗口），按比例回收，保证名称列不被打穿。
+        // 回收时给每列设 56px 地板——再窄也要能显示 "123 MB"，
+        // 否则窄分栏下"大小"列会缩成一个数字都放不下的窄条。
+        let sum = type_w + date_w + size_w;
+        if sum > col_total_max && sum > 0.0 {
+            let k = col_total_max / sum;
+            return [
+                (type_w * k).round().max(56.0),
+                (date_w * k).round().max(56.0),
+                (size_w * k).round().max(56.0),
+            ];
+        }
+        [type_w.round(), date_w.round(), size_w.round()]
     }
 
     fn arranged_entries(&self, entries: &[Entry], query: &str, side: &'static str) -> Vec<Entry> {
@@ -2013,12 +2083,28 @@ impl FileFlowGpui {
         cx.notify();
     }
     fn on_new_folder(&mut self, _: &NewFolder, window: &mut Window, cx: &mut Context<Self>) {
+        if self.new_folder_open {
+            self.new_folder_input.update(cx, |input, cx| input.insert_newline(window, cx));
+            window.focus(&self.new_folder_input.read(cx).focus_handle(cx));
+            return;
+        }
+        self.open_new_item(NewItemKind::Folder, window, cx);
+    }
+    fn on_new_text_file(&mut self, _: &NewTextFile, window: &mut Window, cx: &mut Context<Self>) {
+        if self.new_folder_open {
+            self.new_folder_input.update(cx, |input, cx| input.insert_newline(window, cx));
+            window.focus(&self.new_folder_input.read(cx).focus_handle(cx));
+            return;
+        }
+        self.open_new_item(NewItemKind::TextFile, window, cx);
+    }
+    fn open_new_item(&mut self, kind: NewItemKind, window: &mut Window, cx: &mut Context<Self>) {
         self.new_folder_open = true;
-        self.new_folder_multiple = false;
+        self.new_item_kind = kind;
         self.new_folder_input
-            .update(cx, |input, _| input.set_value("新建文件夹"));
+            .update(cx, |input, _| input.set_value(if kind == NewItemKind::Folder { "新建文件夹" } else { "新建文本文档" }));
         window.focus(&self.new_folder_input.read(cx).focus_handle(cx));
-        self.status = "输入文件夹名称后按 Enter 创建".to_string();
+        self.status = format!("每行新建一个{}；Shift+Enter / Ctrl+N 换行，Enter 创建", kind.label());
         cx.notify();
     }
     fn on_hidden(&mut self, _: &ToggleHidden, _: &mut Window, cx: &mut Context<Self>) {
@@ -2372,16 +2458,10 @@ impl FileFlowGpui {
         }
         if self.new_folder_open {
             let input_value = self.new_folder_input.read(cx).value();
-            let names: Vec<String> = input_value
-                .lines()
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(str::to_owned)
-                .collect();
-            let names = if self.new_folder_multiple {
-                names
-            } else {
-                names.into_iter().take(1).collect()
+            let kind = self.new_item_kind;
+            let names = match new_item_names(&input_value, kind) {
+                Ok(names) => names,
+                Err(error) => { self.status = error; cx.notify(); return; }
             };
             let side = self.active_side;
             let base = if self.active_side == "right" {
@@ -2391,27 +2471,18 @@ impl FileFlowGpui {
             };
             if is_virtual_path(&base) {
                 self.new_folder_open = false;
-                self.status = "虚拟位置不能新建文件夹".to_string();
+                self.status = format!("虚拟位置不能新建{}", kind.label());
                 window.focus(&self.focus_handle);
                 cx.notify();
                 return;
             }
             self.new_folder_open = false;
             window.focus(&self.focus_handle);
-            self.status = "正在新建文件夹…".to_string();
+            self.status = format!("正在新建{}…", kind.label());
             cx.notify();
-            let task = cx.background_executor().spawn(async move {
-                let mut created = Vec::new();
-                for name in names {
-                    let path = unique_path(&base.join(name));
-                    if fs::create_dir(&path).is_ok() {
-                        created.push(path);
-                    }
-                }
-                created
-            });
+            let task = cx.background_executor().spawn(async move { create_new_items(&base, &names, kind) });
             cx.spawn(async move |this, cx| {
-                let created = task.await;
+                let (created, errors) = task.await;
                 wait_out_of_ole_modal(cx).await;
                 let _ = this.update(cx, |this, cx| {
                     if let Some(last) = created.last() {
@@ -2420,7 +2491,8 @@ impl FileFlowGpui {
                     if !created.is_empty() {
                         this.push_undo(UndoEntry::RemoveNew(created.clone()));
                     }
-                    this.status = format!("已创建 {} 个文件夹", created.len());
+                    this.status = if errors.is_empty() { format!("已创建 {} 个{}", created.len(), kind.label()) }
+                        else { format!("已创建 {} 个{}，{} 项失败：{}", created.len(), kind.label(), errors.len(), errors[0]) };
                     this.reload_visible_async(cx);
                 });
             })
@@ -2909,6 +2981,9 @@ impl FileFlowGpui {
             "paste" => self.on_paste_files(&PasteFiles, window, cx),
             "rename" => self.on_rename_selected(&RenameSelected, window, cx),
             "delete" => self.on_delete_selected(&DeleteSelected, window, cx),
+            "permanent-delete" => {
+                self.on_permanent_delete_selected(&PermanentDeleteSelected, window, cx)
+            }
             "new-folder" => self.on_new_folder(&NewFolder, window, cx),
             "new-text" => self.create_text_file(cx),
             "copy-path" => self.on_copy_paths(&CopyPaths, window, cx),
@@ -2997,6 +3072,26 @@ impl FileFlowGpui {
             return;
         }
         self.run_shell_operation(ShellOperationKind::Delete, targets, None, cx);
+    }
+
+    /// Shift+Del：永久删除选中项（不进回收站、Ctrl+Z 无法撤销）。
+    fn on_permanent_delete_selected(
+        &mut self,
+        _: &PermanentDeleteSelected,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let targets = self.selected_paths();
+        if targets.is_empty() {
+            self.status = "请先选择要删除的项目".to_string();
+            cx.notify();
+            return;
+        }
+        // 不可逆操作，先把数量和"不可撤销"说清楚
+        self.status = format!("永久删除 {} 项（不可撤销）…", targets.len());
+        cx.notify();
+        // 不 push_undo：永久删除不进撤销栈
+        self.run_shell_operation(ShellOperationKind::PermanentDelete, targets, None, cx);
     }
     fn push_undo(&mut self, entry: UndoEntry) {
         self.undo_stack.push(entry);
@@ -4055,10 +4150,8 @@ impl FileFlowGpui {
         let list_row_h =
             (self.file_font_size * 1.42 + self.row_spacing).max(27. + self.row_spacing);
         // Details 列宽单一来源：与 entry_list_row / blank_details_cell 一致
-        let details_scale: f32 = if self.split { 0.55 } else { 1.0 };
-        let details_type_w = (112.0 * details_scale).round();
-        let details_date_w = (158.0 * details_scale).round();
-        let details_size_w = (90.0 * details_scale).round();
+        // Details 列宽单一来源：details_col_widths()（表头 / 数据行 / 空白单元格共用）
+        let [details_type_w, details_date_w, details_size_w] = self.details_col_widths();
         let body = if icon_mode {
             // 图标视图（M/L/XL）：uniform_list 虚拟化，每个虚拟行 = 一横条 cols 个图块。
             // 布局公式单一来源：virtual_grid_geometry（渲染/拖框/拖放/键盘导航共用），
@@ -4425,9 +4518,7 @@ impl FileFlowGpui {
                         }
                     }),
                 )
-                .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                    this.on_blank_area_click(side, event, cx);
-                }))
+
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -4573,14 +4664,26 @@ impl FileFlowGpui {
                                         .bottom(px(0.))
                                         .w(px(details_size_w))
                                         .overflow_hidden()
-                                        .truncate()
-                                        .text_right()
-                                        .hover(|style| style.text_color(rgb(BLUE)))
-                                        .child(sort_header_label(
-                                            "大小",
-                                            self.sort_state_for(side).0 == SortColumn::Size,
-                                            self.sort_state_for(side).1,
-                                        ))
+                                        // 左对齐必须用 flex + justify_start：
+                                        // 本单元格是 .flex() 容器，text_right()/
+                                        // truncate() 都只对匿名文本块生效，对 .child()
+                                        // 子元素无效 → "大小"会贴到列右缘，
+                                        // 与下方左对齐的数值不在一条竖线上。
+                                        .flex()
+                                        .items_center()
+                                        .justify_start()
+                                        .child(
+                                            div()
+                                                .min_w(px(0.))
+                                                .overflow_hidden()
+                                                .truncate()
+                                                .hover(|style| style.text_color(rgb(BLUE)))
+                                                .child(sort_header_label(
+                                                    "大小",
+                                                    self.sort_state_for(side).0 == SortColumn::Size,
+                                                    self.sort_state_for(side).1,
+                                                )),
+                                        )
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.sort_by(side, SortColumn::Size, cx)
                                         })),
@@ -4600,6 +4703,11 @@ impl FileFlowGpui {
             .flex()
             .flex_col()
             .overflow_hidden()
+            // 所有视图共用空白点击入口；条目自身的点击处理会停止冒泡。
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                this.on_blank_area_click(side, event, cx);
+            }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -4668,13 +4776,10 @@ impl FileFlowGpui {
         };
         let drop_target = path.clone();
         let size_dir_path = if is_dir { Some(path.clone()) } else { None };
-        // Details 固定像素列：类型/日期/大小从行尾锚定（右对齐排列），
+        // Details 固定像素列：类型/日期/大小从行尾锚定，
         // 名称占剩余宽度——无论文件名多长，三列 x 坐标恒定。
-        // List 模式只有名称列，无 gap 需求。split（分栏）时列宽按 0.55 倍压缩。
-        let scale: f32 = if self.split { 0.55 } else { 1.0 };
-        let details_type_w = (112.0 * scale).round();
-        let details_date_w = (158.0 * scale).round();
-        let details_size_w = (90.0 * scale).round();
+        // 列宽单一来源：details_col_widths()（与表头严格一致）。
+        let [details_type_w, details_date_w, details_size_w] = self.details_col_widths();
         let is_details = view_mode == ViewMode::Details;
         div()
             .id((
@@ -5376,7 +5481,7 @@ impl FileFlowGpui {
         text: String,
         selected: bool,
         focused: bool,
-        align_right: bool,
+        #[allow(unused_variables)] align_right: bool,
         path: PathBuf,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -5404,7 +5509,9 @@ impl FileFlowGpui {
                 rgb(MUTED)
             })
             .text_sm()
-            .when(align_right, |cell| cell.text_right())
+            // 三列统一左对齐。text_right() 在本 flex 容器上对 .child(text) 无效，
+            // 必须用 justify_start()（flex 主轴对齐）才能真正左对齐。
+            .justify_start()
             .child(text)
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                 cx.stop_propagation();
@@ -5638,6 +5745,7 @@ impl FileFlowGpui {
 
     fn new_folder_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .id("new-item-overlay")
             .absolute()
             .top(px(96.))
             .left(px(0.))
@@ -5646,6 +5754,7 @@ impl FileFlowGpui {
             .justify_center()
             .child(
                 div()
+                    .id("new-item-dialog")
                     .w(px(520.))
                     .p_4()
                     .flex()
@@ -5655,6 +5764,17 @@ impl FileFlowGpui {
                     .bg(rgb(0xffffff))
                     .border_1()
                     .border_color(rgb(0xb7c1c8))
+                    // 独立遮挡命中区域：保留子控件事件，阻断下面的文件列表。
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                    .on_mouse_down(MouseButton::Right, cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                    .on_mouse_up(MouseButton::Right, cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                    .on_mouse_down(MouseButton::Navigate(NavigationDirection::Back), cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                    .on_mouse_down(MouseButton::Navigate(NavigationDirection::Forward), cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                    .on_mouse_move(cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                    .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                    .on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()))
                     .child(
                         div()
                             .h(px(28.))
@@ -5662,7 +5782,7 @@ impl FileFlowGpui {
                             .items_center()
                             .justify_between()
                             .text_color(rgb(TEXT))
-                            .child(div().text_size(px(18.)).child("新建文件夹"))
+                            .child(div().text_size(px(18.)).child(format!("新建{}", self.new_item_kind.label())))
                             .child(
                                 div()
                                     .id("new-folder-close")
@@ -5675,16 +5795,10 @@ impl FileFlowGpui {
                                     })),
                             ),
                     )
-                    .child(div().text_sm().text_color(rgb(MUTED)).child(
-                        if self.new_folder_multiple {
-                            "每行创建一个文件夹；Enter 确认"
-                        } else {
-                            "请输入要新建的文件夹名称"
-                        },
-                    ))
+                    .child(div().text_sm().text_color(rgb(MUTED)).child("每行一个名称；Shift+Enter / Ctrl+N 换行，Enter 创建"))
                     .child(
                         div()
-                            .h(px(if self.new_folder_multiple { 92. } else { 36. }))
+                            .h(px(144.))
                             .px_2()
                             .flex()
                             .items_center()
@@ -5692,31 +5806,6 @@ impl FileFlowGpui {
                             .border_color(rgb(BLUE))
                             .rounded_sm()
                             .child(self.new_folder_input.clone()),
-                    )
-                    .child(
-                        div()
-                            .id("new-folder-multiple")
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.new_folder_multiple = !this.new_folder_multiple;
-                                cx.notify();
-                            }))
-                            .child(
-                                div()
-                                    .w(px(16.))
-                                    .h(px(16.))
-                                    .rounded_sm()
-                                    .bg(rgb(if self.new_folder_multiple {
-                                        BLUE
-                                    } else {
-                                        0xffffff
-                                    }))
-                                    .border_1()
-                                    .border_color(rgb(0x8a9299)),
-                            )
-                            .child("新建多个文件夹（可粘贴多行名称）"),
                     )
                     .child(
                         div()
@@ -7042,7 +7131,7 @@ impl FileFlowGpui {
 }
 
 impl Render for FileFlowGpui {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let left_path = self.current_path().to_path_buf();
         let right_path = self.right_path.clone();
         let left_query = self.filter_input.read(cx).value();
@@ -7054,6 +7143,8 @@ impl Render for FileFlowGpui {
         // 搜索/隐藏/类型过滤与排序，导致搜索失效、新文件错位、顺序错乱）
         self.left_display_entries = left_entries.clone();
         self.right_display_entries = right_entries.clone();
+        // 缓存窗口宽度：Details 列宽自适应需要它（行构建闭包拿不到 window）
+        self.last_pane_width = f32::from(window.bounds().size.width).max(280.0);
         div()
             .id("fileflow-root")
             .relative()
@@ -7069,6 +7160,7 @@ impl Render for FileFlowGpui {
             .on_action(cx.listener(Self::on_new_tab))
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_new_folder))
+            .on_action(cx.listener(Self::on_new_text_file))
             .on_action(cx.listener(Self::on_hidden))
             .on_action(cx.listener(Self::on_folder_order))
             .on_action(cx.listener(Self::on_copy_other))
@@ -7089,6 +7181,7 @@ impl Render for FileFlowGpui {
             .on_action(cx.listener(Self::on_paste_files))
             .on_action(cx.listener(Self::on_rename_selected))
             .on_action(cx.listener(Self::on_delete_selected))
+            .on_action(cx.listener(Self::on_permanent_delete_selected))
             .on_action(cx.listener(Self::on_undo))
             .on_action(cx.listener(Self::on_navigate_up))
             .on_action(cx.listener(Self::on_navigate_down))
@@ -8211,11 +8304,19 @@ unsafe fn run_file_operation_sta(
         let operation: IFileOperation =
             CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)?;
         // 同目录复制粘贴不再弹"确认替换"：冲突时自动改名为 "xxx - 副本"
+        //
+        // 永久删除（Shift+Del）必须**清掉 FOF_ALLOWUNDO**：带这个 flag 时，
+        // Shell 即使没有 FOFX_RECYCLEONDELETE 也会建立撤销记录，
+        // 会出现"已永久删除但 Ctrl+Z 还能恢复"的诡异状态。
+        let permanent = matches!(kind, ShellOperationKind::PermanentDelete);
         let flags = FILEOPERATION_FLAGS(
             FOF_NOCONFIRMMKDIR.0
-                | FOF_ALLOWUNDO.0
-                | FOFX_ADDUNDORECORD.0
                 | FOF_RENAMEONCOLLISION.0
+                | if permanent {
+                    0
+                } else {
+                    FOF_ALLOWUNDO.0 | FOFX_ADDUNDORECORD.0
+                }
                 | if matches!(kind, ShellOperationKind::Delete) {
                     FOFX_RECYCLEONDELETE.0
                 } else {
@@ -8246,7 +8347,7 @@ unsafe fn run_file_operation_sta(
                     WPCWSTR::null(),
                     None::<&IFileOperationProgressSink>,
                 )?,
-                ShellOperationKind::Delete => {
+                ShellOperationKind::Delete | ShellOperationKind::PermanentDelete => {
                     operation.DeleteItem(&item, None::<&IFileOperationProgressSink>)?
                 }
             }
@@ -8259,6 +8360,57 @@ unsafe fn run_file_operation_sta(
     })()
     .map_err(|error| error.to_string())
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NewItemKind { Folder, TextFile }
+
+impl NewItemKind {
+    fn label(self) -> &'static str {
+        match self { Self::Folder => "文件夹", Self::TextFile => "TXT 文件" }
+    }
+}
+
+fn new_item_names(input: &str, kind: NewItemKind) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    for (index, line) in input.lines().enumerate() {
+        let name = line.trim();
+        if name.is_empty() { continue; }
+        let stem = name.split('.').next().unwrap_or_default().trim_end().to_ascii_uppercase();
+        let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || (stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && matches!(stem.as_bytes()[3], b'1'..=b'9'));
+        if name == "." || name == ".." || name.ends_with('.') || reserved
+            || name.chars().any(|c| c.is_control() || "<>:\"/\\|?*".contains(c)) {
+            return Err(format!("第 {} 行名称无效：{}", index + 1, name));
+        }
+        names.push(if kind == NewItemKind::TextFile && !name.to_ascii_lowercase().ends_with(".txt") { format!("{name}.txt") } else { name.to_owned() });
+    }
+    if names.is_empty() { return Err("请至少输入一个名称".to_string()); }
+    Ok(names)
+}
+
+fn create_new_items(base: &Path, names: &[String], kind: NewItemKind) -> (Vec<PathBuf>, Vec<String>) {
+    let mut created = Vec::new();
+    let mut errors = Vec::new();
+    for name in names {
+        // create_new/create_dir 都不覆盖已有项目；编号后再原子创建。
+        let mut result = None;
+        for _ in 0..100 {
+            let path = unique_path(&base.join(name));
+            let attempt = match kind {
+                NewItemKind::Folder => fs::create_dir(&path),
+                NewItemKind::TextFile => fs::OpenOptions::new().write(true).create_new(true).open(&path).map(drop),
+            };
+            match attempt {
+                Ok(()) => { created.push(path); result = Some(Ok(())); break; }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => { result = Some(Err(error.to_string())); break; }
+            }
+        }
+        if let Some(Err(error)) = result { errors.push(format!("{name}：{error}")); }
+        else if result.is_none() { errors.push(format!("{name}：重名冲突过多")); }
+    }
+    (created, errors)
 }
 
 fn unique_path(path: &Path) -> PathBuf {
@@ -8385,7 +8537,7 @@ fn cached_filetype_icon_path(path: &Path, size: f32) -> Option<PathBuf> {
         return None;
     }
     let bucket = ((size / 32.0).ceil() as u32).clamp(1, 16);
-    let memo_key = (extension.clone(), bucket);
+    let memo_key = (filetype_icon_identity(&extension, path), bucket);
     let memo = FILETYPE_ICON_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(map) = memo.lock()
         && let Some(hit) = map.get(&memo_key)
@@ -8399,15 +8551,23 @@ fn cached_filetype_icon_path(path: &Path, size: f32) -> Option<PathBuf> {
     computed
 }
 
+// LNK 的图标属于单个快捷方式，不能按扩展名共享（也避免复用旧通用缓存）。
+fn filetype_icon_identity(extension: &str, path: &Path) -> String {
+    if extension == "lnk" {
+        format!("shortcut-v1:{}", path.to_string_lossy().to_lowercase())
+    } else {
+        extension.to_string()
+    }
+}
 /// 磁盘缓存 + 提取。失败也由调用方记住（memo），本会话不重试。
 fn filetype_icon_png(extension: &str, bucket: u32, path: &Path) -> Option<PathBuf> {
     use windows::Win32::UI::Shell::{
-        SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW,
+        SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_LINKOVERLAY, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW,
     };
     use windows::Win32::UI::WindowsAndMessaging::DestroyIcon;
 
     let mut hasher = DefaultHasher::new();
-    extension.hash(&mut hasher);
+    filetype_icon_identity(extension, path).hash(&mut hasher);
     bucket.hash(&mut hasher);
     let cache_dir = thumbnail_cache_dir().join("filetype");
     let cache_path = cache_dir.join(format!("icon_{:016x}.png", hasher.finish()));
@@ -8419,7 +8579,12 @@ fn filetype_icon_png(extension: &str, bucket: u32, path: &Path) -> Option<PathBu
     unsafe {
         let mut wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         let mut info = SHFILEINFOW::default();
-        let flags = SHGFI_ICON | SHGFI_USEFILEATTRIBUTES | SHGFI_LARGEICON;
+        // 快捷方式必须查询真实路径，让 Shell 解析目标/自定义图标。
+        let flags = if extension == "lnk" {
+            SHGFI_ICON | SHGFI_LARGEICON | SHGFI_LINKOVERLAY
+        } else {
+            SHGFI_ICON | SHGFI_USEFILEATTRIBUTES | SHGFI_LARGEICON
+        };
         let result = SHGetFileInfoW(
             WPCWSTR(wide.as_mut_ptr()),
             windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
@@ -10187,6 +10352,11 @@ fn shortcut_specs() -> &'static [ShortcutSpec] {
             default_key: "ctrl-n",
         },
         ShortcutSpec {
+            id: "new_text_file",
+            label: "新建 TXT 文件",
+            default_key: "ctrl-shift-n",
+        },
+        ShortcutSpec {
             id: "hidden",
             label: "显示/隐藏隐藏项",
             default_key: "ctrl-h",
@@ -10359,6 +10529,7 @@ fn app_key_bindings(bindings: &BTreeMap<String, String>) -> Vec<KeyBinding> {
         KeyBinding::new(shortcut_key(bindings, "new_tab"), NewTab, None),
         KeyBinding::new(shortcut_key(bindings, "close_tab"), CloseTab, None),
         KeyBinding::new(shortcut_key(bindings, "new_folder"), NewFolder, None),
+        KeyBinding::new(shortcut_key(bindings, "new_text_file"), NewTextFile, None),
         KeyBinding::new(shortcut_key(bindings, "hidden"), ToggleHidden, None),
         KeyBinding::new(shortcut_key(bindings, "copy_other"), CopyToOther, None),
         KeyBinding::new(shortcut_key(bindings, "move_other"), MoveToOther, None),
@@ -10376,6 +10547,8 @@ fn app_key_bindings(bindings: &BTreeMap<String, String>) -> Vec<KeyBinding> {
         KeyBinding::new(shortcut_key(bindings, "favorite"), ToggleFavorite, None),
         KeyBinding::new(shortcut_key(bindings, "rename"), RenameSelected, None),
         KeyBinding::new(shortcut_key(bindings, "delete"), DeleteSelected, None),
+        // Shift+Del：永久删除（不进回收站、不可撤销）
+        KeyBinding::new("shift-delete", PermanentDeleteSelected, None),
         KeyBinding::new("ctrl-z", Undo, None),
         KeyBinding::new("up", NavigateUp, None),
         KeyBinding::new("down", NavigateDown, None),
@@ -10397,6 +10570,11 @@ fn app_key_bindings(bindings: &BTreeMap<String, String>) -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-shift-6", ViewXLIcons, None),
         KeyBinding::new("escape", ClearTransient, Some("FileFlowTextInput")),
         KeyBinding::new("enter", SubmitAddress, Some("FileFlowTextInput")),
+        KeyBinding::new("shift-enter", text_input::InsertNewline, Some("FileFlowMultilineInput")),
+        KeyBinding::new("ctrl-n", text_input::InsertNewline, Some("FileFlowMultilineInput")),
+        KeyBinding::new("ctrl-shift-n", text_input::InsertNewline, Some("FileFlowMultilineInput")),
+        KeyBinding::new("up", text_input::Up, Some("FileFlowMultilineInput")),
+        KeyBinding::new("down", text_input::Down, Some("FileFlowMultilineInput")),
         KeyBinding::new("f5", Refresh, Some("FileFlowTextInput")),
         KeyBinding::new("space", text_input::InsertSpace, Some("FileFlowTextInput")),
         KeyBinding::new(
@@ -11811,7 +11989,7 @@ fn main() {
     }
     trim_thumbnail_cache();
     // 部署验证标记：升级后看 integration.log 是否出现本行即可确认运行的是新构建
-    integration_log("startup build 2026-10-02 vlist-lh-v2 allviews-vlist display-cache-v1 ui-fix-3a");
+    integration_log("startup build 2026-10-03 blank-click-v1 shortcut-icons-v1");
     let thumbnail_result_rx = start_thumbnail_worker();
     let (watch_command_tx, directory_change_rx) = start_directory_watcher();
     let external_path = external_path_from_args();
@@ -12257,5 +12435,74 @@ mod tests {
         // 会话记忆：同键再次命中不应再触发提取
         let again = cached_filetype_icon_path(Path::new(r"C://probe-not-exist2.zip"), 70.);
         assert_eq!(again.as_deref(), Some(icon.as_path()));
+    }
+
+    #[test]
+    fn multiline_new_item_names_preserve_unicode_and_add_txt_once() {
+        assert_eq!(new_item_names("项目甲\r\n\r\n 项目乙 \n项目丙", NewItemKind::Folder).unwrap(), vec!["项目甲", "项目乙", "项目丙"]);
+        assert_eq!(new_item_names("笔记\nREADME.TXT\n草稿.md", NewItemKind::TextFile).unwrap(), vec!["笔记.txt", "README.TXT", "草稿.md.txt"]);
+        for invalid in ["", " \n\n", "../escape", "..", "D:\\outside", "CON.txt", "COM1", "name."] {
+            assert!(new_item_names(invalid, NewItemKind::Folder).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn batch_creation_creates_all_lines_without_overwriting_existing_files() {
+        let base = std::env::temp_dir().join(format!("fileflow-create-{}", std::process::id()));
+        fs::create_dir_all(&base).unwrap();
+        let names = new_item_names("项目甲\n项目乙\n项目甲", NewItemKind::Folder).unwrap();
+        let (folders, errors) = create_new_items(&base, &names, NewItemKind::Folder);
+        assert!(errors.is_empty());
+        assert_eq!(folders.len(), 3);
+        assert!(folders.iter().all(|path| path.is_dir()));
+        fs::write(base.join("笔记.txt"), "保留原内容").unwrap();
+        let names = new_item_names("笔记\n清单.txt\n笔记", NewItemKind::TextFile).unwrap();
+        let (files, errors) = create_new_items(&base, &names, NewItemKind::TextFile);
+        assert!(errors.is_empty());
+        assert_eq!(files.len(), 3);
+        assert!(files.iter().all(|path| path.extension().is_some_and(|ext| ext == "txt") && fs::read(path).unwrap().is_empty()));
+        assert_eq!(fs::read_to_string(base.join("笔记.txt")).unwrap(), "保留原内容");
+        for file in files { fs::remove_file(file).unwrap(); }
+        fs::remove_file(base.join("笔记.txt")).unwrap();
+        for folder in folders { fs::remove_dir(folder).unwrap(); }
+        fs::remove_dir(base).unwrap();
+    }
+
+    #[test]
+    fn shortcut_icons_use_each_shortcuts_shell_icon() {
+        use windows::Win32::System::Com::IPersistFile;
+        use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+        use windows_core::Interface;
+
+        let directory = std::env::temp_dir().join(format!("fileflow-shortcuts-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let shell_library = PathBuf::from(std::env::var_os("WINDIR").unwrap()).join("System32/shell32.dll");
+        let library_wide: Vec<u16> = shell_library.as_os_str().encode_wide().chain(Some(0)).collect();
+        let shortcuts = [directory.join("folder.lnk"), directory.join("drive.lnk")];
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
+            for (path, icon_index) in shortcuts.iter().zip([3, 8]) {
+                let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).unwrap();
+                link.SetPath(WPCWSTR(library_wide.as_ptr())).unwrap();
+                link.SetIconLocation(WPCWSTR(library_wide.as_ptr()), icon_index).unwrap();
+                let persist: IPersistFile = link.cast().unwrap();
+                let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+                persist.Save(WPCWSTR(wide.as_ptr()), true).unwrap();
+            }
+            let entries = read_entries(&directory);
+            assert!(shortcuts.iter().all(|path| entries.iter().any(|entry| &entry.path == path)));
+            let first = cached_filetype_icon_path(&shortcuts[0], 70.).unwrap();
+            let second = cached_filetype_icon_path(&shortcuts[1], 70.).unwrap();
+            assert_ne!(first, second, "shortcuts must not share the extension cache");
+            let first_image = image::open(first).unwrap().to_rgba8();
+            let second_image = image::open(second).unwrap().to_rgba8();
+            assert!(first_image.pixels().any(|pixel| pixel[3] != 0));
+            assert_ne!(first_image, second_image, "custom shortcut icons must be preserved");
+            CoUninitialize();
+        }
+        for path in shortcuts {
+            fs::remove_file(path).unwrap();
+        }
+        fs::remove_dir(directory).unwrap();
     }
 }
