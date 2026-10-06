@@ -2103,12 +2103,8 @@ impl FileFlowGpui {
         self.reopen_closed_tab(window, cx);
     }
     fn on_toggle_fullscreen(&mut self, _: &ToggleFullscreen, window: &mut Window, cx: &mut Context<Self>) {
-        // 用户也把最大化称作全屏：首次从最大化切换时还原为普通窗口。
-        if window.is_maximized() && !window.is_fullscreen() {
-            toggle_native_maximize(window);
-        } else {
-            window.toggle_fullscreen();
-        }
+        // 与右上角按钮共用最大化/还原：使用工作区，保留任务栏。
+        toggle_native_maximize(window);
         cx.notify();
     }
     fn on_toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
@@ -10392,7 +10388,7 @@ fn shortcut_specs() -> &'static [ShortcutSpec] {
         },
         ShortcutSpec {
             id: "fullscreen",
-            label: "切换全屏/窗口模式",
+            label: "最大化/还原窗口",
             default_key: "alt-enter",
         },
         ShortcutSpec {
@@ -12059,7 +12055,7 @@ fn main() {
     }
     trim_thumbnail_cache();
     // 部署验证标记：升级后看 integration.log 是否出现本行即可确认运行的是新构建
-    integration_log("startup build 2026-10-06 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 fullscreen-v1");
+    integration_log("startup build 2026-10-06 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 maximize-v1");
     let thumbnail_result_rx = start_thumbnail_worker();
     let (watch_command_tx, directory_change_rx) = start_directory_watcher();
     let external_path = external_path_from_args();

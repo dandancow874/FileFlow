@@ -166,7 +166,7 @@ C:\Users\Administrator\FileFlow\target\release\fileflow.exe
 
 ## 重要行为说明
 
-- `Alt+Enter` 切换普通窗口与全屏，退出全屏恢复原窗口尺寸；当前已最大化时先还原普通窗口。`Win+E` 只唤起 FileFlow，保留全屏/最大化状态；隐藏到托盘后唤起也不还原窗口大小。
+- `Alt+Enter` 与右上角最大化按钮共用最大化/还原逻辑，使用屏幕工作区并保留任务栏，还原时恢复原窗口尺寸。`Win+E` 只唤起 FileFlow，保留最大化状态；隐藏到托盘后唤起也不还原窗口大小。
 - `Ctrl+Shift+T` 按关闭时间逆序恢复本次运行最近 32 个已关闭标签，回到原栏、原位置并激活。恢复右栏标签时自动显示双栏；最后一个标签不允许关闭，无关闭记录时快捷键不执行操作。关闭记录不跨程序重启保存。
 - 复制、移动、删除使用 Windows Shell `IFileOperation`。删除设置 `FOFX_RECYCLEONDELETE` 和撤销记录，不启动 PowerShell，也不直接永久删除。
 - 重命名和批量新建文件夹也在 GPUI 后台执行器中完成，网络目录不会占住界面线程。
