@@ -185,6 +185,7 @@ actions!(
         PreviousView,
         NewTab,
         CloseTab,
+        ReopenClosedTab,
         NewFolder,
         NewTextFile,
         ToggleHidden,
@@ -397,9 +398,36 @@ impl ViewMode {
     }
 }
 
+struct ClosedTab {
+    side: &'static str,
+    index: usize,
+    path: PathBuf,
+}
+
+// 关闭非活动标签时维持当前目录；最后一个标签不关闭，也不进入恢复记录。
+fn remove_tab_path(tabs: &mut Vec<PathBuf>, active: &mut usize, index: usize) -> Option<PathBuf> {
+    if tabs.len() <= 1 || index >= tabs.len() {
+        return None;
+    }
+    let path = tabs.remove(index);
+    if index < *active {
+        *active -= 1;
+    }
+    *active = (*active).min(tabs.len() - 1);
+    Some(path)
+}
+
+fn restore_tab_path(tabs: &mut Vec<PathBuf>, active: &mut usize, index: usize, path: PathBuf) {
+    let index = index.min(tabs.len());
+    tabs.insert(index, path);
+    *active = index;
+}
+
 struct FileFlowGpui {
     tabs: Vec<PathBuf>,
     active_tab: usize,
+    /// 左右栏共用最近关闭记录，按关闭时间逆序恢复；仅保留本次运行最近 32 条。
+    closed_tabs: Vec<ClosedTab>,
     left_back: Vec<PathBuf>,
     left_forward: Vec<PathBuf>,
     right_back: Vec<PathBuf>,
@@ -547,6 +575,7 @@ impl FileFlowGpui {
         Self {
             tabs: vec![start.clone()],
             active_tab: 0,
+            closed_tabs: Vec::new(),
             left_back: Vec::new(),
             left_forward: Vec::new(),
             right_back: Vec::new(),
@@ -972,24 +1001,48 @@ impl FileFlowGpui {
     }
 
     fn close_right_tab(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self.right_tabs.len() == 1 {
+        let Some(path) = remove_tab_path(&mut self.right_tabs, &mut self.right_active_tab, index) else {
             return;
-        }
-        self.right_tabs.remove(index);
-        self.right_active_tab = self.right_active_tab.min(self.right_tabs.len() - 1);
+        };
+        self.remember_closed_tab("right", index, path);
         self.right_path = self.right_tabs[self.right_active_tab].clone();
         self.load_side_async("right", self.right_path.clone(), cx);
         cx.notify();
     }
 
     fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self.tabs.len() == 1 {
+        let Some(path) = remove_tab_path(&mut self.tabs, &mut self.active_tab, index) else {
             return;
-        }
-        self.tabs.remove(index);
-        self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+        };
+        self.remember_closed_tab("left", index, path);
         let path = self.current_path().to_path_buf();
         self.load_side_async("left", path, cx);
+        cx.notify();
+    }
+
+    fn remember_closed_tab(&mut self, side: &'static str, index: usize, path: PathBuf) {
+        if self.closed_tabs.len() == 32 {
+            self.closed_tabs.remove(0);
+        }
+        self.closed_tabs.push(ClosedTab { side, index, path });
+    }
+
+    fn reopen_closed_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.closed_tabs.pop() else {
+            return;
+        };
+        self.active_side = tab.side;
+        if tab.side == "right" {
+            self.split = true;
+            restore_tab_path(&mut self.right_tabs, &mut self.right_active_tab, tab.index, tab.path.clone());
+            self.right_path = tab.path.clone();
+        } else {
+            restore_tab_path(&mut self.tabs, &mut self.active_tab, tab.index, tab.path.clone());
+        }
+        self.load_side_async(tab.side, tab.path, cx);
+        self.focus_handle.focus(window);
+        self.status = "已恢复关闭的标签页".to_string();
+        self.save_config();
         cx.notify();
     }
 
@@ -2044,6 +2097,9 @@ impl FileFlowGpui {
         } else {
             self.close_tab(self.active_tab, cx);
         }
+    }
+    fn on_reopen_closed_tab(&mut self, _: &ReopenClosedTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.reopen_closed_tab(window, cx);
     }
     fn on_toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
         self.show_sidebar = !self.show_sidebar;
@@ -7134,6 +7190,7 @@ impl Render for FileFlowGpui {
             .on_action(cx.listener(Self::on_previous_view))
             .on_action(cx.listener(Self::on_new_tab))
             .on_action(cx.listener(Self::on_close_tab))
+            .on_action(cx.listener(Self::on_reopen_closed_tab))
             .on_action(cx.listener(Self::on_new_folder))
             .on_action(cx.listener(Self::on_new_text_file))
             .on_action(cx.listener(Self::on_hidden))
@@ -10322,6 +10379,11 @@ fn shortcut_specs() -> &'static [ShortcutSpec] {
             default_key: "ctrl-w",
         },
         ShortcutSpec {
+            id: "reopen_closed_tab",
+            label: "恢复关闭的标签页",
+            default_key: "ctrl-shift-t",
+        },
+        ShortcutSpec {
             id: "new_folder",
             label: "新建文件夹",
             default_key: "ctrl-n",
@@ -10503,6 +10565,7 @@ fn app_key_bindings(bindings: &BTreeMap<String, String>) -> Vec<KeyBinding> {
         KeyBinding::new(shortcut_key(bindings, "split"), ToggleSplit, None),
         KeyBinding::new(shortcut_key(bindings, "new_tab"), NewTab, None),
         KeyBinding::new(shortcut_key(bindings, "close_tab"), CloseTab, None),
+        KeyBinding::new(shortcut_key(bindings, "reopen_closed_tab"), ReopenClosedTab, None),
         KeyBinding::new(shortcut_key(bindings, "new_folder"), NewFolder, None),
         KeyBinding::new(shortcut_key(bindings, "new_text_file"), NewTextFile, None),
         KeyBinding::new(shortcut_key(bindings, "hidden"), ToggleHidden, None),
@@ -11983,7 +12046,7 @@ fn main() {
     }
     trim_thumbnail_cache();
     // 部署验证标记：升级后看 integration.log 是否出现本行即可确认运行的是新构建
-    integration_log("startup build 2026-10-06 keyboard-nav-v1 external-new-tab-v1");
+    integration_log("startup build 2026-10-06 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1");
     let thumbnail_result_rx = start_thumbnail_worker();
     let (watch_command_tx, directory_change_rx) = start_directory_watcher();
     let external_path = external_path_from_args();
@@ -12161,6 +12224,41 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_tabs_preserves_the_active_directory_and_keeps_the_last_tab() {
+        let mut tabs: Vec<PathBuf> = ["A", "B", "C", "D"].map(PathBuf::from).into();
+        let mut active = 2;
+        assert_eq!(remove_tab_path(&mut tabs, &mut active, 0), Some(PathBuf::from("A")));
+        assert_eq!(tabs[active], PathBuf::from("C"));
+        assert_eq!(remove_tab_path(&mut tabs, &mut active, 2), Some(PathBuf::from("D")));
+        assert_eq!(tabs[active], PathBuf::from("C"));
+        assert_eq!(remove_tab_path(&mut tabs, &mut active, 1), Some(PathBuf::from("C")));
+        assert_eq!(tabs[active], PathBuf::from("B"));
+        assert_eq!(remove_tab_path(&mut tabs, &mut active, 0), None);
+        assert_eq!(remove_tab_path(&mut tabs, &mut active, 99), None);
+        assert_eq!(tabs.len(), 1);
+    }
+
+    #[test]
+    fn restoring_closed_tabs_recovers_order_and_selects_the_restored_path() {
+        let original: Vec<PathBuf> = ["A", "B", "C", "D"].map(PathBuf::from).into();
+        let mut tabs = original.clone();
+        let mut active = 2;
+        let first = remove_tab_path(&mut tabs, &mut active, 1).unwrap();
+        let second = remove_tab_path(&mut tabs, &mut active, 2).unwrap();
+        restore_tab_path(&mut tabs, &mut active, 2, second.clone());
+        assert_eq!(tabs[active], second);
+        restore_tab_path(&mut tabs, &mut active, 1, first.clone());
+        assert_eq!(tabs[active], first);
+        assert_eq!(tabs, original);
+        restore_tab_path(&mut tabs, &mut active, 99, PathBuf::from("E"));
+        assert_eq!(active, 4);
+        assert_eq!(tabs[active], PathBuf::from("E"));
+        let bindings = BTreeMap::new();
+        assert_eq!(shortcut_key(&bindings, "reopen_closed_tab"), "ctrl-shift-t");
+        assert_eq!(shortcut_key(&bindings, "new_tab"), "ctrl-t");
+    }
 
     #[test]
     fn keyboard_navigation_scrolls_to_virtual_row_in_every_view() {

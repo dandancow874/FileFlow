@@ -93,7 +93,7 @@ C:\Users\Administrator\FileFlow\target\release\fileflow.exe
 - 双栏可独立进入目录和返回上级；双击目录进入，单击选择
 - GPUI 本地图片管线：M/L/XL 图标视图加载 jpg/png/webp/bmp/gif/tiff，加载失败时稳定回退到文件图标
 - 底栏文件夹按钮支持四态循环：仅文件夹、混合、文件夹优先、文件优先
-- GPUI 快捷键：`F5` / `Ctrl+R` 刷新、`Alt+Up` / `Backspace` 上级、`Ctrl+B` 双栏、`Ctrl+N` 新建文件夹、`Ctrl+Shift+T` 新建标签、`Ctrl+H` 显示隐藏项目、`Ctrl+1/2` 在双栏间复制/移动所选项目
+- GPUI 快捷键：`F5` / `Ctrl+R` 刷新、`Alt+Up` / `Backspace` 上级、`Ctrl+B` 双栏、`Ctrl+N` 新建文件夹、`Ctrl+T` 新建标签、`Ctrl+W` 关闭标签、`Ctrl+Shift+T` 恢复关闭的标签、`Ctrl+H` 显示隐藏项目、`Ctrl+1/2` 在双栏间复制/移动所选项目
 - 在文件区按 `Ctrl+滚轮` 切换六种查看方式，GPUI 用 140ms 淡入过渡处理视图切换
 - 左侧栏、顶部标签、面包屑、底部筛选输入与状态条均已切到 GPUI 原生布局；文件夹图标不再依赖字体字形
 - 面包屑可以逐级点击跳转；`Ctrl+L` 和地址栏图标进入完整路径编辑，`Enter` 进入路径，`Esc` 返回普通面包屑
@@ -166,6 +166,7 @@ C:\Users\Administrator\FileFlow\target\release\fileflow.exe
 
 ## 重要行为说明
 
+- `Ctrl+Shift+T` 按关闭时间逆序恢复本次运行最近 32 个已关闭标签，回到原栏、原位置并激活。恢复右栏标签时自动显示双栏；最后一个标签不允许关闭，无关闭记录时快捷键不执行操作。关闭记录不跨程序重启保存。
 - 复制、移动、删除使用 Windows Shell `IFileOperation`。删除设置 `FOFX_RECYCLEONDELETE` 和撤销记录，不启动 PowerShell，也不直接永久删除。
 - 重命名和批量新建文件夹也在 GPUI 后台执行器中完成，网络目录不会占住界面线程。
 - 剪贴板优先发布 Windows Shell `IDataObject`，并保留 `CF_HDROP` 兼容回退，以便 QQ、网盘和其他 Windows 软件接收文件。
