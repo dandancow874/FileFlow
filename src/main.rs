@@ -862,6 +862,7 @@ impl FileFlowGpui {
             return;
         }
         self.active_side = "left";
+        self.add_tab(cx);
         self.navigate_left(folder.clone(), cx);
         if let Some(selected) = selected {
             self.left_selected.clear();
@@ -1365,14 +1366,7 @@ impl FileFlowGpui {
             .position(|entry| entry.path == path)
             .unwrap_or(target_index);
         let view_mode = self.view_mode_for(self.active_side);
-        let scroll_index = if matches!(
-            view_mode,
-            ViewMode::Columns | ViewMode::MIcons | ViewMode::LIcons | ViewMode::XLIcons
-        ) {
-            arranged_index
-        } else {
-            arranged_index + 1
-        };
+        let scroll_index = entry_scroll_row(view_mode, arranged_index, self.grid_columns_for(self.active_side, view_mode));
         if self.active_side == "left" {
             self.left_scroll_handle.scroll_to_item(scroll_index, ScrollStrategy::Top);
         } else {
@@ -1443,37 +1437,17 @@ impl FileFlowGpui {
             .and_then(|path| entries.iter().position(|entry| entry.path == path))
             .unwrap_or(0);
         let view_mode = self.view_mode_for(side);
-        let (row, column, columns) = match view_mode {
-            ViewMode::Columns | ViewMode::MIcons | ViewMode::LIcons | ViewMode::XLIcons => {
-                // 网格：列数未知（视窗宽度决定），用启发式——图标的实际列宽
-                let columns = self.grid_columns_for(side, view_mode).max(1);
-                (current / columns, current % columns, columns)
-            }
-            ViewMode::Details | ViewMode::List => (current, 0, 1),
-        };
-        let total = entries.len() as i32;
-        let next = if view_mode == ViewMode::Details || view_mode == ViewMode::List {
-            (row as i32 + row_step + col_step).clamp(0, total - 1) as usize
-        } else {
-            let next_row = (row as i32 + row_step).clamp(0, (total - 1) / columns as i32);
-            let next_column = (column as i32 + col_step).clamp(0, columns as i32 - 1);
-            let candidate = next_row * columns as i32 + next_column;
-            candidate.clamp(0, total - 1) as usize
+        let columns = self.grid_columns_for(side, view_mode);
+        let next = if focused.is_none() { 0 } else {
+            keyboard_selection_index(current, entries.len(), view_mode, columns, row_step, col_step)
         };
         if next == current && focused.is_some() {
             return;
         }
         let path = entries[next].path.clone();
         self.set_single_selection(side, path.clone());
-        // 滚动到可见（列表视图首行是表头 +1）
-        let scroll_index = if matches!(
-            view_mode,
-            ViewMode::Columns | ViewMode::MIcons | ViewMode::LIcons | ViewMode::XLIcons
-        ) {
-            next
-        } else {
-            next + 1
-        };
+        // uniform_list 渲染单位是行；表头在列表外，不能额外 +1。
+        let scroll_index = entry_scroll_row(view_mode, next, columns);
         if side == "left" {
             self.left_scroll_handle.scroll_to_item(scroll_index, ScrollStrategy::Top);
         } else {
@@ -4304,10 +4278,11 @@ impl FileFlowGpui {
             let visible_paths_for_rows = visible_paths.clone();
             let base_for_cols = base_scroll_handle.clone();
             let pane_w = f32::from(base_for_cols.bounds().size.width).max(1.);
-            let item_w = 240.;
-            let cell_h = ((font_size * 1.5 + row_spacing).max(28. + row_spacing)).ceil();
-            let cols = (((pane_w - 16.0) / item_w).floor() as usize).max(1);
-            let row_count = entries.len().div_ceil(cols);
+            let geo = virtual_grid_geometry(view_mode, font_size, row_spacing, pane_w, entries.len());
+            let item_w = geo.cell_w;
+            let cell_h = geo.cell_h.ceil();
+            let cols = geo.cols;
+            let row_count = geo.rows();
             let (sort_col, sort_asc) = self.sort_state_for(side);
             let data_epoch = (sort_col as u8) << 1 | sort_asc as u8;
             let list = uniform_list(
@@ -10737,6 +10712,25 @@ fn pixel_value(value: Pixels) -> f32 {
     value / px(1.)
 }
 
+/// 虚拟列表按横行而不是条目滚动；Details/List 的表头是列表外的兄弟节点。
+fn entry_scroll_row(mode: ViewMode, index: usize, columns: usize) -> usize {
+    match mode {
+        ViewMode::Columns | ViewMode::MIcons | ViewMode::LIcons | ViewMode::XLIcons => index / columns.max(1),
+        ViewMode::Details | ViewMode::List => index,
+    }
+}
+
+/// 左右按显示顺序移动一项并跨行，上下按实际列数移动一行；首尾不循环。
+fn keyboard_selection_index(current: usize, count: usize, mode: ViewMode, columns: usize, row_step: i32, col_step: i32) -> usize {
+    if count == 0 { return 0; }
+    let columns = match mode {
+        ViewMode::Columns | ViewMode::MIcons | ViewMode::LIcons | ViewMode::XLIcons => columns.max(1),
+        ViewMode::Details | ViewMode::List => 1,
+    };
+    let next = current.min(count - 1) as i64 + row_step as i64 * columns as i64 + col_step as i64;
+    next.clamp(0, count as i64 - 1) as usize
+}
+
 /// 虚拟化网格布局几何（单一事实来源）：渲染行构建、拖框命中、拖放命中、
 /// 键盘导航全部从这一个公式取参数，保证三者严丝合缝。
 /// 返回 (cols, cell_w, cell_h, stride_x, stride_y, pad)；
@@ -11989,7 +11983,7 @@ fn main() {
     }
     trim_thumbnail_cache();
     // 部署验证标记：升级后看 integration.log 是否出现本行即可确认运行的是新构建
-    integration_log("startup build 2026-10-03 blank-click-v1 shortcut-icons-v1");
+    integration_log("startup build 2026-10-06 keyboard-nav-v1 external-new-tab-v1");
     let thumbnail_result_rx = start_thumbnail_worker();
     let (watch_command_tx, directory_change_rx) = start_directory_watcher();
     let external_path = external_path_from_args();
@@ -12167,6 +12161,35 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyboard_navigation_scrolls_to_virtual_row_in_every_view() {
+        for mode in [ViewMode::Columns, ViewMode::MIcons, ViewMode::LIcons, ViewMode::XLIcons] {
+            assert_eq!(entry_scroll_row(mode, 57, 4), 14);
+            assert_eq!(entry_scroll_row(mode, 59, 4), 14);
+            assert_eq!(entry_scroll_row(mode, 60, 4), 15);
+            assert_eq!(entry_scroll_row(mode, 3, 0), 3);
+        }
+        for mode in [ViewMode::Details, ViewMode::List] {
+            assert_eq!(entry_scroll_row(mode, 57, 4), 57);
+            assert_eq!(keyboard_selection_index(4, 20, mode, 4, 0, -1), 3);
+        }
+    }
+
+    #[test]
+    fn grid_arrows_cross_rows_one_item_at_a_time() {
+        for mode in [ViewMode::Columns, ViewMode::MIcons, ViewMode::LIcons, ViewMode::XLIcons] {
+            for columns in [1, 2, 3, 5, 9] {
+                for current in 0..23 {
+                    assert_eq!(keyboard_selection_index(current, 23, mode, columns, 0, -1), current.saturating_sub(1));
+                    assert_eq!(keyboard_selection_index(current, 23, mode, columns, 0, 1), (current + 1).min(22));
+                    assert_eq!(keyboard_selection_index(current, 23, mode, columns, 1, 0), (current + columns).min(22));
+                    assert_eq!(keyboard_selection_index(current, 23, mode, columns, -1, 0), current.saturating_sub(columns));
+                }
+            }
+        }
+        assert_eq!(keyboard_selection_index(0, 0, ViewMode::Columns, 0, 0, 1), 0);
+    }
 
     #[test]
     fn parses_external_file_urls_and_quoted_unc_paths() {
