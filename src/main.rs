@@ -104,7 +104,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, GWLP_WNDPROC, HTCAPTION, WM_CANCELMODE, WM_CAPTURECHANGED,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
     WM_NCLBUTTONUP, WM_NCMOUSEMOVE, WM_NCHITTEST, WNDPROC, SetWindowLongPtrW,
-    RegisterClassW, SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOWNORMAL, SM_CXDOUBLECLK,
+    RegisterClassW, SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SM_CXDOUBLECLK,
     SM_CYDOUBLECLK, SetForegroundWindow,
     SetWindowsHookExW, ShowWindow, ShowWindowAsync, SwitchToThisWindow, IsIconic, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
@@ -186,6 +186,7 @@ actions!(
         NewTab,
         CloseTab,
         ReopenClosedTab,
+        ToggleFullscreen,
         NewFolder,
         NewTextFile,
         ToggleHidden,
@@ -2100,6 +2101,15 @@ impl FileFlowGpui {
     }
     fn on_reopen_closed_tab(&mut self, _: &ReopenClosedTab, window: &mut Window, cx: &mut Context<Self>) {
         self.reopen_closed_tab(window, cx);
+    }
+    fn on_toggle_fullscreen(&mut self, _: &ToggleFullscreen, window: &mut Window, cx: &mut Context<Self>) {
+        // 用户也把最大化称作全屏：首次从最大化切换时还原为普通窗口。
+        if window.is_maximized() && !window.is_fullscreen() {
+            toggle_native_maximize(window);
+        } else {
+            window.toggle_fullscreen();
+        }
+        cx.notify();
     }
     fn on_toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
         self.show_sidebar = !self.show_sidebar;
@@ -7191,6 +7201,7 @@ impl Render for FileFlowGpui {
             .on_action(cx.listener(Self::on_new_tab))
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_reopen_closed_tab))
+            .on_action(cx.listener(Self::on_toggle_fullscreen))
             .on_action(cx.listener(Self::on_new_folder))
             .on_action(cx.listener(Self::on_new_text_file))
             .on_action(cx.listener(Self::on_hidden))
@@ -9087,13 +9098,12 @@ fn focus_fileflow_window() {
         if foreground_thread != 0 && foreground_thread != current_thread {
             let _ = AttachThreadInput(current_thread, foreground_thread, 1);
         }
-        // 只在最小化或隐藏到托盘时才恢复（SW_RESTORE 对最大化窗口的语义是
-        // "取消最大化"会把全屏窗口变小——F2 重命名置前时绝不能碰最大化状态）。
-        // 关闭到托盘 = SW_HIDE：IsIconic 为假但窗口不可见，SetForegroundWindow
-        // 对隐藏窗口无效，必须先 Show。
-        if IsIconic(hwnd) != 0 || IsWindowVisible(hwnd) == 0 {
+        // 最小化需要恢复；隐藏到托盘只重新显示，保留最大化/全屏状态。
+        // 对可见窗口使用 SW_RESTORE 会取消最大化，唤起不能改变窗口大小。
+        if IsIconic(hwnd) != 0 {
             let _ = ShowWindow(hwnd, SW_RESTORE);
-            let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+        } else if IsWindowVisible(hwnd) == 0 {
+            let _ = ShowWindow(hwnd, SW_SHOW);
         }
         let _ = BringWindowToTop(hwnd);
         let _ = SetForegroundWindow(hwnd);
@@ -9706,15 +9716,12 @@ unsafe extern "system" fn win_e_keyboard_hook(
             // 钩子回调里绝不调用 AttachThreadInput/SetForegroundWindow 这类会发
             // 同步跨线程消息的 API：钩子挂在全局，目标窗口过程若在 gpui 借用中，
             // 同步消息会把后台任务泵进来 → RefCell 重入 panic 且无法 unwind。
-            // 只用完全异步的 ShowWindowAsync + SwitchToThisWindow(flash=0 不抢前台)，
-            // 再 PostMessage 让 FileFlow 自己在前台安全地把窗口带上来。
+            // 只 PostMessage，让主窗口处理唤起；钩子不恢复窗口大小，
+            // 否则 SW_RESTORE 会把已最大化的窗口变成普通窗口。
             unsafe {
                 let hwnd = cached_or_find_fileflow_hwnd();
                 if !hwnd.is_null() {
-                    let _ = ShowWindowAsync(hwnd, SW_RESTORE);
-                    SwitchToThisWindow(hwnd, 0);
-                    // lparam 高位=1：托盘窗口过程识别为"唤起"指令，
-                    // 在托盘线程安全执行 focus_fileflow_window
+                    // 主窗口过程识别唤起指令，执行保留窗口状态的 focus。
                     let _ = PostMessageW(hwnd, WM_FILEFLOW_TRAY, 0, 0x10000);
                 }
             }
@@ -10384,6 +10391,11 @@ fn shortcut_specs() -> &'static [ShortcutSpec] {
             default_key: "ctrl-shift-t",
         },
         ShortcutSpec {
+            id: "fullscreen",
+            label: "切换全屏/窗口模式",
+            default_key: "alt-enter",
+        },
+        ShortcutSpec {
             id: "new_folder",
             label: "新建文件夹",
             default_key: "ctrl-n",
@@ -10566,6 +10578,7 @@ fn app_key_bindings(bindings: &BTreeMap<String, String>) -> Vec<KeyBinding> {
         KeyBinding::new(shortcut_key(bindings, "new_tab"), NewTab, None),
         KeyBinding::new(shortcut_key(bindings, "close_tab"), CloseTab, None),
         KeyBinding::new(shortcut_key(bindings, "reopen_closed_tab"), ReopenClosedTab, None),
+        KeyBinding::new(shortcut_key(bindings, "fullscreen"), ToggleFullscreen, None),
         KeyBinding::new(shortcut_key(bindings, "new_folder"), NewFolder, None),
         KeyBinding::new(shortcut_key(bindings, "new_text_file"), NewTextFile, None),
         KeyBinding::new(shortcut_key(bindings, "hidden"), ToggleHidden, None),
@@ -12046,7 +12059,7 @@ fn main() {
     }
     trim_thumbnail_cache();
     // 部署验证标记：升级后看 integration.log 是否出现本行即可确认运行的是新构建
-    integration_log("startup build 2026-10-06 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1");
+    integration_log("startup build 2026-10-06 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 fullscreen-v1");
     let thumbnail_result_rx = start_thumbnail_worker();
     let (watch_command_tx, directory_change_rx) = start_directory_watcher();
     let external_path = external_path_from_args();
