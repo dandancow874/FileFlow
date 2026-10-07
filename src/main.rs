@@ -1764,31 +1764,45 @@ impl FileFlowGpui {
         if distance >= 8.0 {
             state.active = true;
         }
-        // 窗口内始终走内部移动；只有离开窗口后才交给 OLE。
-        // GPUI 的原生 Drop 接收 ExternalPaths，不能接回 FileDragPayload。
+        // 普通窗口内拖动走内部移动；离开窗口或按 Alt 准备切换软件时交给 OLE。
+        // 若等 Alt+Tab 后才交接，系统已转移鼠标捕获，内部拖动就无法继续。
         let size = window.viewport_size();
         let outside = event.position.x < px(0.)
             || event.position.y < px(0.)
             || event.position.x >= size.width
             || event.position.y >= size.height;
-        if state.active && outside {
-            let sources = state.sources.clone();
-            self.status = format!("正在拖出 {} 项", sources.len());
-            self.file_drag = None;
-            cx.stop_active_drag(window);
-            unsafe {
-                let _ = ReleaseCapture();
-            }
-            cx.notify();
-            let ok = start_windows_file_drag(&sources);
-            self.status = if ok {
-                format!("已把 {} 项交给 Windows 拖拽", sources.len())
-            } else {
-                "外部拖拽没有被目标应用接收".to_string()
-            };
-            self.suppress_blank_click = true;
-            cx.notify();
+        if state.active && (outside || event.modifiers.alt) {
+            self.handoff_file_drag(window, cx);
         }
+    }
+
+    fn handoff_file_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.file_drag.as_ref() else {
+            return;
+        };
+        // on_drag 可能消费首次 move，因此也接受 GPUI 已确认的拖动。
+        // Alt 单独按下、普通点击以及松开鼠标后的修饰键变化都不能启动 OLE。
+        if !(state.active || cx.has_active_drag())
+            || unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } >= 0
+        {
+            return;
+        }
+        let sources = self.file_drag.take().unwrap().sources;
+        integration_log("drag handoff to Windows (outside window or Alt held)");
+        self.status = format!("正在拖出 {} 项", sources.len());
+        cx.stop_active_drag(window);
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        cx.notify();
+        let ok = start_windows_file_drag(&sources);
+        self.status = if ok {
+            format!("已把 {} 项交给 Windows 拖拽", sources.len())
+        } else {
+            "外部拖拽没有被目标应用接收".to_string()
+        };
+        self.suppress_blank_click = true;
+        cx.notify();
     }
 
     fn finish_file_drag(
@@ -7207,6 +7221,11 @@ impl Render for FileFlowGpui {
             .id("fileflow-root")
             .relative()
             .track_focus(&self.focus_handle)
+            .on_modifiers_changed(cx.listener(|this, event: &gpui::ModifiersChangedEvent, window, cx| {
+                if event.modifiers.alt {
+                    this.handoff_file_drag(window, cx);
+                }
+            }))
             .on_action(cx.listener(Self::on_refresh))
             .on_action(cx.listener(Self::on_up))
             .on_action(cx.listener(Self::on_back))
@@ -12182,7 +12201,7 @@ fn main() {
     }
     trim_thumbnail_cache();
     // 部署验证标记：升级后看 integration.log 是否出现本行即可确认运行的是新构建
-    integration_log("startup build 2026-10-07 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 maximize-v1 ime-selection-v1 internal-drag-v1 transfer-undo-v1 reliability-v1");
+    integration_log("startup build 2026-10-07 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 maximize-v1 ime-selection-v1 internal-drag-v1 transfer-undo-v1 reliability-v1 alt-tab-drag-v1");
     let thumbnail_result_rx = start_thumbnail_worker();
     let (watch_command_tx, directory_change_rx) = start_directory_watcher();
     let external_path = external_path_from_args();
