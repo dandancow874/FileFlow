@@ -1,6 +1,8 @@
 #![windows_subsystem = "windows"]
 
 mod text_input;
+mod transfer_undo;
+use transfer_undo::{TransferProgress, MoveRecord, ShellOperationResult, undo_moved_items, undo_copied_items};
 
 use chrono::{DateTime, Local};
 use gpui::StatefulInteractiveElement;
@@ -29,7 +31,7 @@ use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicIsize, AtomicU32, AtomicUsize, Ordering as AtomicOrdering,
 };
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use text_input::TextInput;
@@ -253,6 +255,10 @@ enum ShellOperationKind {
 /// Ctrl+Z 撤销记录：把 from 路径恢复为 to 路径（新建 = to 为 None）
 #[derive(Clone)]
 enum UndoEntry {
+    /// 移动：保存 Shell 实际生成的路径，包含冲突时自动改名的结果。
+    Move(Vec<MoveRecord>),
+    /// 复制：只撤销本次实际生成的副本。
+    Copy(Vec<PathBuf>),
     /// 删除（回收站）：恢复这些路径
     Restore(Vec<PathBuf>),
     /// 重命名：改回旧名
@@ -353,9 +359,7 @@ struct FileDragState {
     start: Point<Pixels>,
     current: Point<Pixels>,
     sources: Vec<PathBuf>,
-    modifiers: gpui::Modifiers,
     active: bool,
-    external_started: bool,
 }
 
 #[derive(Clone)]
@@ -524,8 +528,10 @@ struct FileFlowGpui {
     watch_command_tx: mpsc::Sender<WatchCommand>,
     shortcut_bindings: BTreeMap<String, String>,
     shortcut_recording: Option<String>,
-    /// Ctrl+Z 撤销栈（删除/重命名/新建），上限 32 条
+    /// Ctrl+Z 撤销栈（移动/复制/删除/重命名/新建），上限 32 条
     undo_stack: Vec<UndoEntry>,
+    pending_file_operations: usize,
+    undo_transfer_in_progress: bool,
 }
 
 impl FileFlowGpui {
@@ -663,6 +669,8 @@ impl FileFlowGpui {
             shortcut_bindings: saved.shortcut_bindings,
             shortcut_recording: None,
             undo_stack: Vec::new(),
+            pending_file_operations: 0,
+            undo_transfer_in_progress: false,
         }
     }
 
@@ -1718,9 +1726,7 @@ impl FileFlowGpui {
             start: position,
             current: position,
             sources,
-            modifiers,
             active: false,
-            external_started: false,
         });
         self.drag_select = None;
         cx.notify();
@@ -1737,7 +1743,6 @@ impl FileFlowGpui {
             cx.stop_active_drag(window);
             return;
         }
-        let mut external_sources = None;
         let Some(state) = self.file_drag.as_mut() else {
             return;
         };
@@ -1747,12 +1752,16 @@ impl FileFlowGpui {
         let distance = (dx * dx + dy * dy).sqrt();
         if distance >= 8.0 {
             state.active = true;
-            if !state.external_started {
-                state.external_started = true;
-                external_sources = Some(state.sources.clone());
-            }
         }
-        if let Some(sources) = external_sources {
+        // 窗口内始终走内部移动；只有离开窗口后才交给 OLE。
+        // GPUI 的原生 Drop 接收 ExternalPaths，不能接回 FileDragPayload。
+        let size = window.viewport_size();
+        let outside = event.position.x < px(0.)
+            || event.position.y < px(0.)
+            || event.position.x >= size.width
+            || event.position.y >= size.height;
+        if state.active && outside {
+            let sources = state.sources.clone();
             self.status = format!("正在拖出 {} 项", sources.len());
             self.file_drag = None;
             cx.stop_active_drag(window);
@@ -1774,6 +1783,7 @@ impl FileFlowGpui {
     fn finish_file_drag(
         &mut self,
         event: &MouseUpEvent,
+        target_dir: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -1781,10 +1791,10 @@ impl FileFlowGpui {
         let Some(state) = self.file_drag.take() else {
             return false;
         };
-        if !state.active {
+        // 快速拖动可能只有一次 move，被 GPUI 的 on_drag 消费；用松开位置补判。
+        if !state.active && (event.position - state.start).magnitude() < 8.0 {
             return false;
         }
-        let target_dir = self.file_drop_target(event.position, window);
         let Some(target_dir) = target_dir else {
             self.status = "未找到可放置的位置".to_string();
             self.suppress_blank_click = true;
@@ -1797,73 +1807,34 @@ impl FileFlowGpui {
             cx.notify();
             return true;
         }
-        let copy = state.modifiers.control;
+        let copy = event.modifiers.control;
         self.drop_files_to(&state.sources, &target_dir, copy, cx);
         self.suppress_blank_click = true;
         true
     }
 
-    fn file_drop_target(&self, position: Point<Pixels>, _window: &Window) -> Option<PathBuf> {
-        let point = (pixel_value(position.x), pixel_value(position.y));
-        let mut best: Option<(f32, &PathBuf)> = None;
-        for (side, entries) in [("left", &self.left_entries), ("right", &self.right_entries)] {
-            if side == "right" && !self.split {
-                continue;
-            }
-            // ScrollHandle 真实绘制 bounds + 滚动偏移（entry_bounds 在 track_scroll
-            // 容器上恒为空，不可用）
-            let handle = if side == "left" {
-                self.left_scroll_handle.0.borrow().base_handle.clone()
-            } else {
-                self.right_scroll_handle.0.borrow().base_handle.clone()
-            };
-            let offset = handle.offset();
-            for (index, entry) in entries.iter().enumerate() {
-                if !entry.is_dir {
-                    continue;
-                }
-                let Some(bounds) = handle.bounds_for_item(index) else {
-                    continue;
-                };
-                let rect = (
-                    pixel_value(bounds.left()) + pixel_value(offset.x),
-                    pixel_value(bounds.top()) + pixel_value(offset.y),
-                    pixel_value(bounds.right()) + pixel_value(offset.x),
-                    pixel_value(bounds.bottom()) + pixel_value(offset.y),
-                );
-                if point_in_rect(point, rect) {
-                    // 多个嵌套命中时取面积最小（最内层）的
-                    let area = (rect.2 - rect.0) * (rect.3 - rect.1);
-                    if best.as_ref().is_none_or(|(a, _)| area < *a) {
-                        best = Some((area, &entry.path));
-                    }
-                }
-            }
-        }
-        if let Some((_, path)) = best {
-            return Some(path.clone());
-        }
-        let side = self.side_at_position(position, _window);
-        Some(if side == "right" && self.split {
+    fn pane_drop_target(&self, side: &'static str) -> PathBuf {
+        if side == "right" && self.split {
             self.right_path.clone()
         } else {
             self.current_path().to_path_buf()
-        })
+        }
     }
 
-    fn side_at_position(&self, position: Point<Pixels>, window: &Window) -> &'static str {
-        if !self.split {
-            return "left";
-        }
-        let window_width = pixel_value(window.bounds().size.width);
-        let sidebar_w = if self.show_sidebar { 218.0 } else { 0.0 };
-        let pane_area_w = (window_width - sidebar_w).max(1.0);
-        let middle = sidebar_w + pane_area_w / 2.0;
-        if pixel_value(position.x) >= middle {
-            "right"
-        } else {
-            "left"
-        }
+    fn accept_file_drop(
+        &mut self,
+        payload: &FileDragPayload,
+        target: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 与 mouse_up 回退共用一次性消费语义，避免下一次点击重复移动。
+        let sources = self.file_drag.take().map_or_else(
+            || payload.sources.clone(),
+            |state| state.sources,
+        );
+        self.suppress_blank_click = true;
+        self.drop_files_to(&sources, target, window.modifiers().control, cx);
     }
 
     fn update_drag_select(
@@ -2325,6 +2296,13 @@ impl FileFlowGpui {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.file_drag.take().is_some() || cx.has_active_drag() {
+            cx.stop_active_drag(window);
+            self.suppress_blank_click = true;
+            self.status = "已取消拖动".to_string();
+            cx.notify();
+            return;
+        }
         if self.context_menu_open {
             self.context_menu_open = false;
             window.focus(&self.focus_handle);
@@ -3135,8 +3113,6 @@ impl FileFlowGpui {
             self.undo_stack.remove(0);
         }
     }
-    /// Ctrl+Z：撤销最近一次 删除(回收站恢复)/重命名/新建文件夹。
-    /// 用 IFileOperation 的 verb 走 Shell 撤销通道。
     fn on_navigate_up(&mut self, _: &NavigateUp, window: &mut Window, cx: &mut Context<Self>) {
         self.navigate_selection(-1, 0, window, cx);
     }
@@ -3151,12 +3127,46 @@ impl FileFlowGpui {
     }
 
     fn on_undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_file_operations > 0 || self.undo_transfer_in_progress {
+            self.status = "请等待当前文件操作完成后再撤销".to_string();
+            cx.notify();
+            return;
+        }
         let Some(entry) = self.undo_stack.pop() else {
             self.status = "没有可撤销的操作".to_string();
             cx.notify();
             return;
         };
         match entry {
+            UndoEntry::Move(_) | UndoEntry::Copy(_) => {
+                self.undo_transfer_in_progress = true;
+                let label = if matches!(entry, UndoEntry::Move(_)) { "移动" } else { "复制" };
+                self.status = format!("正在撤销{label}…");
+                cx.notify();
+                let task = cx.background_executor().spawn(async move {
+                    match entry {
+                        UndoEntry::Move(items) => undo_moved_items(items),
+                        UndoEntry::Copy(paths) => undo_copied_items(paths),
+                        _ => unreachable!(),
+                    }
+                });
+                cx.spawn(async move |this, cx| {
+                    let outcome = task.await;
+                    wait_out_of_ole_modal(cx).await;
+                    let _ = this.update(cx, |this, context| {
+                        this.undo_transfer_in_progress = false;
+                        if let Some(remaining) = outcome.remaining {
+                            this.push_undo(remaining);
+                        }
+                        this.status = if outcome.errors.is_empty() {
+                            format!("已撤销{label} {} 项", outcome.restored)
+                        } else {
+                            format!("已恢复 {} 项；{}", outcome.restored, outcome.errors.join("；"))
+                        };
+                        this.reload_visible_async(context);
+                    });
+                }).detach();
+            }
             UndoEntry::Restore(paths) => {
                 self.status = format!("正在恢复 {} 项…", paths.len());
                 cx.notify();
@@ -3367,24 +3377,43 @@ impl FileFlowGpui {
         if sources.is_empty() {
             return;
         }
+        if self.undo_transfer_in_progress {
+            self.status = "请等待撤销完成".to_string();
+            cx.notify();
+            return;
+        }
         let count = sources.len();
         // 删除走回收站，可 Ctrl+Z 恢复
         if matches!(kind, ShellOperationKind::Delete) {
             self.push_undo(UndoEntry::Restore(sources.clone()));
         }
         self.status = format!("正在{} {} 项", kind.progress_label(), count);
+        self.pending_file_operations += 1;
         self.left_selected.clear();
         self.right_selected.clear();
         cx.notify();
         let task = cx
             .background_executor()
-            .spawn(async move { perform_shell_file_operation(kind, &sources, target.as_deref()) });
+            .spawn(async move { perform_shell_file_operation(kind, &sources, target.as_deref(), None) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             wait_out_of_ole_modal(cx).await;
             let _ = this.update(cx, |this, cx| {
-                this.status = match result {
+                this.pending_file_operations = this.pending_file_operations.saturating_sub(1);
+                let moved_count = result.moved.len();
+                let copied_count = result.copied.len();
+                if copied_count > 0 {
+                    this.push_undo(UndoEntry::Copy(result.copied));
+                }
+                if moved_count > 0 {
+                    this.push_undo(UndoEntry::Move(result.moved));
+                }
+                this.status = match result.result {
+                    Ok(()) if matches!(kind, ShellOperationKind::Copy) => format!("已复制 {copied_count} 项，可按 Ctrl+Z 撤销"),
+                    Ok(()) if matches!(kind, ShellOperationKind::Move) => format!("已移动 {moved_count} 项，可按 Ctrl+Z 撤销"),
                     Ok(()) => format!("已{} {} 项", kind.progress_label(), count),
+                    Err(error) if copied_count > 0 => format!("已复制 {copied_count} 项，可按 Ctrl+Z 撤销；其余操作未完成：{error}"),
+                    Err(error) if moved_count > 0 => format!("已移动 {moved_count} 项，可按 Ctrl+Z 撤销；其余操作未完成：{error}"),
                     Err(error) => format!("{}失败：{}", kind.progress_label(), error),
                 };
                 this.reload_visible_async(cx);
@@ -4305,8 +4334,8 @@ impl FileFlowGpui {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                    if !this.finish_file_drag(event, window, cx) {
+                cx.listener(move |this, event: &MouseUpEvent, window, cx| {
+                    if !this.finish_file_drag(event, Some(this.pane_drop_target(side)), window, cx) {
                         this.finish_drag_select(event, window, cx);
                     }
                 }),
@@ -4437,8 +4466,8 @@ impl FileFlowGpui {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                    if !this.finish_file_drag(event, window, cx) {
+                cx.listener(move |this, event: &MouseUpEvent, window, cx| {
+                    if !this.finish_file_drag(event, Some(this.pane_drop_target(side)), window, cx) {
                         this.finish_drag_select(event, window, cx);
                     }
                 }),
@@ -4549,8 +4578,8 @@ impl FileFlowGpui {
                 }))
                 .on_mouse_up(
                     MouseButton::Left,
-                    cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                        if !this.finish_file_drag(event, window, cx) {
+                    cx.listener(move |this, event: &MouseUpEvent, window, cx| {
+                        if !this.finish_file_drag(event, Some(this.pane_drop_target(side)), window, cx) {
                             this.finish_drag_select(event, window, cx);
                         }
                     }),
@@ -4763,13 +4792,9 @@ impl FileFlowGpui {
                     this.on_blank_area_mouse_down(side, event, cx);
                 }),
             )
-            .on_drop(cx.listener(move |this, payload: &FileDragPayload, _, cx| {
-                let target = if side == "right" && this.split {
-                    this.right_path.clone()
-                } else {
-                    this.current_path().to_path_buf()
-                };
-                this.drop_files_to(&payload.sources, &target, false, cx);
+            .on_drop(cx.listener(move |this, payload: &FileDragPayload, window, cx| {
+                let target = this.pane_drop_target(side);
+                this.accept_file_drop(payload, &target, window, cx);
             }))
             .child(body)
     }
@@ -4812,6 +4837,7 @@ impl FileFlowGpui {
             name.clone()
         };
         let drop_target = path.clone();
+        let mouse_up_target = if is_dir { path.clone() } else { self.pane_drop_target(side) };
         let size_dir_path = if is_dir { Some(path.clone()) } else { None };
         // Details 固定像素列：类型/日期/大小从行尾锚定，
         // 名称占剩余宽度——无论文件名多长，三列 x 坐标恒定。
@@ -4845,11 +4871,23 @@ impl FileFlowGpui {
             .hover(move |style| style.bg(rgb(if selected { BLUE } else { HOVER_BLUE })))
             .when(is_dir, |row| {
                 row.on_drop(cx.listener(
-                    move |this, payload: &FileDragPayload, _, cx| {
-                        this.drop_files_to(&payload.sources, &drop_target, false, cx);
+                    move |this, payload: &FileDragPayload, window, cx| {
+                        this.accept_file_drop(payload, &drop_target, window, cx);
                     },
                 ))
             })
+            // Details 的日期/大小等子列也属于文件夹落点。
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener({
+                    let target = mouse_up_target.clone();
+                    move |this, event: &MouseUpEvent, window, cx| {
+                        if this.finish_file_drag(event, Some(target.clone()), window, cx) {
+                            cx.stop_propagation();
+                        }
+                    }
+                }),
+            )
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                 cx.stop_propagation();
                 if !event.is_right_click() {
@@ -4901,6 +4939,12 @@ impl FileFlowGpui {
                     .gap_2()
                     .overflow_hidden()
                     .cursor_move()
+                    .on_drop(cx.listener({
+                        let target = mouse_up_target.clone();
+                        move |this, payload: &FileDragPayload, window, cx| {
+                            this.accept_file_drop(payload, &target, window, cx);
+                        }
+                    }))
                     .on_drag(
                         FileDragPayload {
                             sources: drag_sources.clone(),
@@ -4950,9 +4994,9 @@ impl FileFlowGpui {
                     ))
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                        cx.listener(move |this, event: &MouseUpEvent, window, cx| {
                             cx.stop_propagation();
-                            if !this.finish_file_drag(event, window, cx) {
+                            if !this.finish_file_drag(event, Some(mouse_up_target.clone()), window, cx) {
                                 this.finish_drag_select(event, window, cx);
                             }
                         }),
@@ -5114,6 +5158,7 @@ impl FileFlowGpui {
             label.clone()
         };
         let drop_target = path.clone();
+        let mouse_up_target = if is_dir { path.clone() } else { self.pane_drop_target(side) };
         let label_line_height = ((font_size * 0.86).clamp(12., 18.) * 1.25).ceil();
         let label_lines = 3usize;
         let icon_size = match view_mode {
@@ -5194,8 +5239,8 @@ impl FileFlowGpui {
             )
             .when(is_dir, |item| {
                 item.on_drop(cx.listener(
-                    move |this, payload: &FileDragPayload, _, cx| {
-                        this.drop_files_to(&payload.sources, &drop_target, false, cx);
+                    move |this, payload: &FileDragPayload, window, cx| {
+                        this.accept_file_drop(payload, &drop_target, window, cx);
                     },
                 ))
             })
@@ -5235,9 +5280,9 @@ impl FileFlowGpui {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                cx.listener(move |this, event: &MouseUpEvent, window, cx| {
                     cx.stop_propagation();
-                    if !this.finish_file_drag(event, window, cx) {
+                    if !this.finish_file_drag(event, Some(mouse_up_target.clone()), window, cx) {
                         this.finish_drag_select(event, window, cx);
                     }
                 }),
@@ -5354,6 +5399,7 @@ impl FileFlowGpui {
             name.clone()
         };
         let drop_target = path.clone();
+        let mouse_up_target = if is_dir { path.clone() } else { self.pane_drop_target(side) };
         div()
             .id((
                 if side == "left" {
@@ -5391,8 +5437,8 @@ impl FileFlowGpui {
             )
             .when(is_dir, |item| {
                 item.on_drop(cx.listener(
-                    move |this, payload: &FileDragPayload, _, cx| {
-                        this.drop_files_to(&payload.sources, &drop_target, false, cx);
+                    move |this, payload: &FileDragPayload, window, cx| {
+                        this.accept_file_drop(payload, &drop_target, window, cx);
                     },
                 ))
             })
@@ -5432,9 +5478,9 @@ impl FileFlowGpui {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                cx.listener(move |this, event: &MouseUpEvent, window, cx| {
                     cx.stop_propagation();
-                    if !this.finish_file_drag(event, window, cx) {
+                    if !this.finish_file_drag(event, Some(mouse_up_target.clone()), window, cx) {
                         this.finish_drag_select(event, window, cx);
                     }
                 }),
@@ -7261,6 +7307,9 @@ impl Render for FileFlowGpui {
                     this.go_forward(this.active_side, cx);
                 }),
             )
+            .on_drag_move(cx.listener(|this, event: &gpui::DragMoveEvent<FileDragPayload>, window, cx| {
+                this.update_file_drag(&event.event, window, cx);
+            }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 this.update_file_drag(event, window, cx);
                 this.update_drag_select(event, window, cx);
@@ -7268,7 +7317,7 @@ impl Render for FileFlowGpui {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, window, cx| {
-                    if !this.finish_file_drag(event, window, cx) {
+                    if !this.finish_file_drag(event, None, window, cx) {
                         this.finish_drag_select(event, window, cx);
                     }
                 }),
@@ -8282,9 +8331,15 @@ fn perform_shell_file_operation(
     kind: ShellOperationKind,
     sources: &[PathBuf],
     target: Option<&Path>,
-) -> Result<(), String> {
+    new_name: Option<&std::ffi::OsStr>,
+) -> ShellOperationResult {
     let sources = sources.to_vec();
     let target = target.map(|path| path.to_path_buf());
+    let new_name = new_name.map(|name| name.to_os_string());
+    let moved = Arc::new(Mutex::new(Vec::new()));
+    let worker_moved = moved.clone();
+    let copied = Arc::new(Mutex::new(Vec::new()));
+    let worker_copied = copied.clone();
     let (result_tx, result_rx) = mpsc::channel::<Result<(), String>>();
     let worker = std::thread::Builder::new()
         .name("fileflow-shell-op".into())
@@ -8295,7 +8350,7 @@ fn perform_shell_file_operation(
                 if co_result.is_err() && co_result != RPC_E_CHANGED_MODE {
                     Err(format!("COM 初始化失败：{co_result:?}"))
                 } else {
-                    let outcome = run_file_operation_sta(kind, &sources, target.as_deref());
+                    let outcome = run_file_operation_sta(kind, &sources, target.as_deref(), new_name.as_deref(), &worker_moved, &worker_copied);
                     if should_uninitialize {
                         CoUninitialize();
                     }
@@ -8325,18 +8380,24 @@ fn perform_shell_file_operation(
                 std::thread::sleep(std::time::Duration::from_millis(30));
             }
         });
-    match worker {
+    let result = match worker {
         Ok(_) => result_rx
             .recv()
             .unwrap_or_else(|_| Err("文件操作线程异常退出".to_string())),
         Err(error) => Err(format!("启动文件操作线程失败：{error}")),
-    }
+    };
+    let moved = std::mem::take(&mut *moved.lock().unwrap());
+    let copied = std::mem::take(&mut *copied.lock().unwrap());
+    ShellOperationResult { result, moved, copied }
 }
 
 unsafe fn run_file_operation_sta(
     kind: ShellOperationKind,
     sources: &[PathBuf],
     target: Option<&Path>,
+    new_name: Option<&std::ffi::OsStr>,
+    moved: &Arc<Mutex<Vec<MoveRecord>>>,
+    copied: &Arc<Mutex<Vec<PathBuf>>>,
 ) -> Result<(), String> {
     unsafe {
     (|| -> WResult<()> {
@@ -8374,18 +8435,25 @@ unsafe fn run_file_operation_sta(
         for source in sources {
             let item = shell_item_from_path(source)?;
             match kind {
-                ShellOperationKind::Copy => operation.CopyItem(
-                    &item,
-                    destination.as_ref().expect("copy destination"),
-                    WPCWSTR::null(),
-                    None::<&IFileOperationProgressSink>,
-                )?,
-                ShellOperationKind::Move => operation.MoveItem(
-                    &item,
-                    destination.as_ref().expect("move destination"),
-                    WPCWSTR::null(),
-                    None::<&IFileOperationProgressSink>,
-                )?,
+                ShellOperationKind::Copy => {
+                    let sink: IFileOperationProgressSink = TransferProgress::new(source.clone(), item.clone(), moved.clone(), copied.clone()).into();
+                    operation.CopyItem(
+                        &item,
+                        destination.as_ref().expect("copy destination"),
+                        WPCWSTR::null(),
+                        &sink,
+                    )?;
+                }
+                ShellOperationKind::Move => {
+                    let sink: IFileOperationProgressSink = TransferProgress::new(source.clone(), item.clone(), moved.clone(), copied.clone()).into();
+                    let name = new_name.map(|name| name.encode_wide().chain(Some(0)).collect::<Vec<_>>());
+                    operation.MoveItem(
+                        &item,
+                        destination.as_ref().expect("move destination"),
+                        name.as_ref().map_or(WPCWSTR::null(), |name| WPCWSTR(name.as_ptr())),
+                        &sink,
+                    )?;
+                }
                 ShellOperationKind::Delete | ShellOperationKind::PermanentDelete => {
                     operation.DeleteItem(&item, None::<&IFileOperationProgressSink>)?
                 }
@@ -10886,10 +10954,6 @@ fn rect_intersects(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> bool {
     a_left <= b_right && a_right >= b_left && a_top <= b_bottom && a_bottom >= b_top
 }
 
-fn point_in_rect(point: (f32, f32), rect: (f32, f32, f32, f32)) -> bool {
-    point.0 >= rect.0 && point.0 <= rect.2 && point.1 >= rect.1 && point.1 <= rect.3
-}
-
 unsafe extern "system" fn shell_menu_owner_proc(
     hwnd: HWND,
     message: u32,
@@ -11828,7 +11892,7 @@ fn start_windows_file_drag(files: &[PathBuf]) -> bool {
                 "drag end hdrop_data=true result=0x{:08X} effect=0x{:X}",
                 result.0 as u32, effect.0
             ));
-            result == S_OK || result == DRAGDROP_S_DROP
+            (result == S_OK || result == DRAGDROP_S_DROP) && effect.0 != 0
         }
     };
     OLE_MODAL_ACTIVE.store(false, AtomicOrdering::Relaxed);
@@ -12055,7 +12119,7 @@ fn main() {
     }
     trim_thumbnail_cache();
     // 部署验证标记：升级后看 integration.log 是否出现本行即可确认运行的是新构建
-    integration_log("startup build 2026-10-06 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 maximize-v1");
+    integration_log("startup build 2026-10-07 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 maximize-v1 ime-selection-v1 internal-drag-v1 transfer-undo-v1");
     let thumbnail_result_rx = start_thumbnail_worker();
     let (watch_command_tx, directory_change_rx) = start_directory_watcher();
     let external_path = external_path_from_args();

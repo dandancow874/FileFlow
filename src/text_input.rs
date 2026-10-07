@@ -48,6 +48,38 @@ pub struct TextInput {
     line_height: Pixels,
 }
 
+fn utf16_offset_to_utf8(text: &str, offset: usize) -> usize {
+    let mut utf8 = 0;
+    let mut utf16 = 0;
+    for ch in text.chars() {
+        if utf16 >= offset {
+            break;
+        }
+        utf16 += ch.len_utf16();
+        utf8 += ch.len_utf8();
+    }
+    utf8
+}
+
+/// IME 的选区相对本次组合串，以 UTF-16 计数；文档选区使用 UTF-8 字节位置。
+fn composition_selection_range(
+    insertion_start: usize,
+    composition: &str,
+    selection_utf16: Option<&Range<usize>>,
+) -> Range<usize> {
+    match selection_utf16 {
+        Some(selection) => {
+            let start = utf16_offset_to_utf8(composition, selection.start);
+            let end = utf16_offset_to_utf8(composition, selection.end).max(start);
+            insertion_start + start..insertion_start + end
+        }
+        None => {
+            let end = insertion_start + composition.len();
+            end..end
+        }
+    }
+}
+
 impl TextInput {
     pub fn new(cx: &mut Context<Self>, placeholder: impl Into<SharedString>) -> Self {
         Self {
@@ -79,6 +111,7 @@ impl TextInput {
     }
     pub fn set_value(&mut self, value: impl Into<SharedString>) {
         self.content = value.into();
+        self.marked_range = None;
         self.select_all_internal();
         self.scroll_handle.set_offset(point(px(0.), px(0.)));
     }
@@ -141,16 +174,7 @@ impl TextInput {
             .unwrap_or(self.content.len())
     }
     fn offset_from_utf16(&self, offset: usize) -> usize {
-        let mut utf8 = 0;
-        let mut utf16 = 0;
-        for ch in self.content.chars() {
-            if utf16 >= offset {
-                break;
-            }
-            utf16 += ch.len_utf16();
-            utf8 += ch.len_utf8();
-        }
-        utf8
+        utf16_offset_to_utf8(&self.content, offset)
     }
     fn offset_to_utf16(&self, offset: usize) -> usize {
         let mut utf16 = 0;
@@ -336,6 +360,7 @@ impl EntityInputHandler for TextInput {
         self.content =
             (self.content[..range.start].to_owned() + new_text + &self.content[range.end..]).into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
+        self.selection_reversed = false;
         self.marked_range.take();
         self.reveal_cursor = true;
         cx.notify();
@@ -357,11 +382,12 @@ impl EntityInputHandler for TextInput {
             (self.content[..range.start].to_owned() + new_text + &self.content[range.end..]).into();
         self.marked_range =
             (!new_text.is_empty()).then_some(range.start..range.start + new_text.len());
-        self.selected_range = new_selected_range_utf16
-            .as_ref()
-            .map(|range| self.range_from_utf16(range))
-            .map(|range| range.start + range.start..range.end + range.end)
-            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        self.selected_range = composition_selection_range(
+            range.start,
+            new_text,
+            new_selected_range_utf16.as_ref(),
+        );
+        self.selection_reversed = false;
         self.reveal_cursor = true;
         cx.notify();
     }
@@ -562,5 +588,44 @@ impl Render for TextInput {
 impl Focusable for TextInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ime_first_pinyin_letter_keeps_multiline_cursor_in_bounds() {
+        // 崩溃日志中的场景：一字节拼音串、IME 光标 1..1，旧实现变成 2..2。
+        for composition in ["n", "ni", "ni'hao", "你好"] {
+            let caret = composition.encode_utf16().count();
+            let selection = composition_selection_range(0, composition, Some(&(caret..caret)));
+            assert_eq!(selection, composition.len()..composition.len());
+            assert_eq!(composition[..selection.end].matches('\n').count(), 0);
+        }
+    }
+
+    #[test]
+    fn ime_selection_is_relative_to_composition_after_multiline_unicode_prefix() {
+        let prefix = "第一行\n📁前缀";
+        let composition = "中文😀x";
+        let content = format!("{prefix}{composition}后缀");
+        let selected = composition_selection_range(prefix.len(), composition, Some(&(1..4)));
+        assert_eq!(&content[selected.clone()], "文😀");
+        assert_eq!(content[..selected.end].matches('\n').count(), 1);
+        let caret = composition_selection_range(prefix.len(), composition, Some(&(2..2)));
+        assert_eq!(caret.start, prefix.len() + "中文".len());
+        assert!(caret.is_empty());
+    }
+
+    #[test]
+    fn ime_empty_and_clamped_selection_stays_on_utf8_boundaries() {
+        assert_eq!(composition_selection_range(7, "", Some(&(0..0))), 7..7);
+        assert_eq!(composition_selection_range(7, "中文", None), 13..13);
+        assert_eq!(composition_selection_range(7, "中😀", Some(&(99..99))), 14..14);
+        let range = composition_selection_range(0, "😀", Some(&(1..1)));
+        assert_eq!(range, 4..4);
+        assert!("😀".get(..range.end).is_some());
     }
 }
