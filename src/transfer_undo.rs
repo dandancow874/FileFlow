@@ -154,6 +154,54 @@ pub(super) fn undo_copied_items(paths: Vec<PathBuf>) -> UndoResult {
     }
 }
 
+pub(super) fn undo_renamed_items(mut items: Vec<MoveRecord>) -> UndoResult {
+    // 反向执行才能先释放后续重命名占用的原路径；不用中间临时名，失败不丢文件。
+    items.reverse();
+    let mut outcome = undo_moved_items(items);
+    if let Some(UndoEntry::Move(mut remaining)) = outcome.remaining.take() {
+        remaining.reverse();
+        outcome.remaining = Some(UndoEntry::RenameBatch(remaining));
+    }
+    outcome
+}
+
+pub(super) fn undo_new_items(paths: Vec<PathBuf>) -> UndoResult {
+    let mut removable = Vec::new();
+    let mut remaining = Vec::new();
+    let mut errors = Vec::new();
+    for path in paths {
+        let empty = std::fs::symlink_metadata(&path).and_then(|meta| {
+            if meta.is_file() {
+                Ok(meta.len() == 0)
+            } else if meta.is_dir() {
+                Ok(std::fs::read_dir(&path)?.next().is_none())
+            } else {
+                Ok(false)
+            }
+        });
+        match empty {
+            Ok(true) => removable.push(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            result => {
+                errors.push(match result {
+                    Err(error) => format!("无法撤销 {}：{error}", path.display()),
+                    _ => format!("项目已有内容或类型已变化，已保留：{}", path.display()),
+                });
+                remaining.push(path);
+            }
+        }
+    }
+    // 空文件/空目录也走回收站，防止检查之后有其它程序写入内容导致永久丢失。
+    let mut outcome = undo_copied_items(removable);
+    if let Some(UndoEntry::Copy(failed)) = outcome.remaining.take() {
+        remaining.extend(failed);
+    }
+    errors.append(&mut outcome.errors);
+    outcome.errors = errors;
+    outcome.remaining = (!remaining.is_empty()).then_some(UndoEntry::RemoveNew(remaining));
+    outcome
+}
+
 #[allow(unused_variables)]
 impl IFileOperationProgressSink_Impl for TransferProgress_Impl {
     fn StartOperations(&self) -> windows::core::Result<()> {
@@ -300,6 +348,44 @@ impl IFileOperationProgressSink_Impl for TransferProgress_Impl {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn undo_new_txt_and_folder_preserves_items_with_new_content() {
+        let root = std::env::temp_dir().join(format!(
+            "fileflow-new-undo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let empty_txt = root.join("empty.txt");
+        let edited_txt = root.join("edited.txt");
+        let empty_dir = root.join("empty-dir");
+        let used_dir = root.join("used-dir");
+        fs::write(&empty_txt, b"").unwrap();
+        fs::write(&edited_txt, b"keep edited content").unwrap();
+        fs::create_dir(&empty_dir).unwrap();
+        fs::create_dir(&used_dir).unwrap();
+        fs::write(used_dir.join("keep.txt"), b"keep child").unwrap();
+        let result = undo_new_items(vec![
+            empty_txt.clone(),
+            edited_txt.clone(),
+            empty_dir.clone(),
+            used_dir.clone(),
+        ]);
+        assert_eq!(result.restored, 2);
+        assert!(!empty_txt.exists() && !empty_dir.exists());
+        assert_eq!(fs::read(&edited_txt).unwrap(), b"keep edited content");
+        assert_eq!(fs::read(used_dir.join("keep.txt")).unwrap(), b"keep child");
+        assert_eq!(result.errors.len(), 2);
+        let Some(UndoEntry::RemoveNew(remaining)) = result.remaining else {
+            panic!("missing retry")
+        };
+        assert_eq!(remaining, vec![edited_txt, used_dir]);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn shell_transfers_record_actual_paths_and_undo_without_overwriting() {

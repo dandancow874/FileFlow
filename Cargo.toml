@@ -1,6 +1,6 @@
 [package]
 name = "fileflow"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 [dependencies]
@@ -17,3 +17,11 @@ windows-core = "0.61.2"
 
 [build-dependencies]
 winresource = "0.1"
+
+# 崩溃定位用：release 默认不带调试信息，panic 堆栈只有地址没有函数名。
+# 只给本项目的 crate 开 line-tables（依赖保持默认，避免全量重编）。
+[profile.release]
+debug = 1
+
+[profile.release.package."*"]
+debug = false

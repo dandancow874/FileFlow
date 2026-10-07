@@ -2,7 +2,7 @@
 
 mod text_input;
 mod transfer_undo;
-use transfer_undo::{TransferProgress, MoveRecord, ShellOperationResult, undo_moved_items, undo_copied_items};
+use transfer_undo::{TransferProgress, MoveRecord, ShellOperationResult, undo_moved_items, undo_copied_items, undo_new_items, undo_renamed_items};
 
 use chrono::{DateTime, Local};
 use gpui::StatefulInteractiveElement;
@@ -264,9 +264,21 @@ enum UndoEntry {
     /// 重命名：改回旧名
     Rename { from: PathBuf, to: PathBuf },
     /// 批量重命名：from/to 一一对应改回
-    RenameBatch { from: Vec<PathBuf>, to: Vec<PathBuf> },
+    RenameBatch(Vec<MoveRecord>),
     /// 新建文件夹/文件：删除恢复
     RemoveNew(Vec<PathBuf>),
+}
+
+impl UndoEntry {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Move(_) => "移动",
+            Self::Copy(_) => "复制",
+            Self::Restore(_) => "删除",
+            Self::Rename { .. } | Self::RenameBatch(_) => "重命名",
+            Self::RemoveNew(_) => "新建",
+        }
+    }
 }
 
 impl ShellOperationKind {
@@ -452,6 +464,7 @@ struct FileFlowGpui {
     left_view_mode: ViewMode,
     right_view_mode: ViewMode,
     status: String,
+    config_warning: Option<String>,
     folder_order: FolderOrder,
     show_hidden: bool,
     show_sidebar: bool,
@@ -598,7 +611,8 @@ impl FileFlowGpui {
             right_display_entries: Vec::new(),
             left_view_mode: saved.view_mode,
             right_view_mode: saved.view_mode,
-            status: "GPUI 迁移版：文件系统核心正在迁移".to_string(),
+            status: "就绪".to_string(),
+            config_warning: saved.warning.clone(),
             folder_order: FolderOrder::FoldersFirst,
             show_hidden: saved.show_hidden,
             show_sidebar: saved.show_sidebar,
@@ -709,7 +723,6 @@ impl FileFlowGpui {
             self.left_load_generation = self.left_load_generation.wrapping_add(1);
             self.left_load_generation
         };
-        self.status = format!("正在加载 {}", path.display());
         self.sync_watched_paths();
         cx.notify();
 
@@ -736,13 +749,11 @@ impl FileFlowGpui {
                 if !still_current {
                     return;
                 }
-                let count = entries.len();
                 if side == "right" {
                     this.right_entries = entries;
                 } else {
                     this.left_entries = entries;
                 }
-                this.status = format!("{} 项", count);
                 cx.notify();
             });
         })
@@ -2228,6 +2239,11 @@ impl FileFlowGpui {
         }
     }
     fn create_text_file(&mut self, cx: &mut Context<Self>) {
+        if self.undo_transfer_in_progress {
+            self.status = "请等待撤销完成".to_string();
+            cx.notify();
+            return;
+        }
         let folder = if self.context_menu_side == "right" && self.split {
             self.right_path.clone()
         } else {
@@ -2250,6 +2266,7 @@ impl FileFlowGpui {
             .open(&path)
         {
             Ok(_) => {
+                self.push_undo(UndoEntry::RemoveNew(vec![path.clone()]));
                 self.refresh(cx);
                 self.set_single_selection(self.context_menu_side, path.clone());
                 format!(
@@ -2369,6 +2386,11 @@ impl FileFlowGpui {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.undo_transfer_in_progress {
+            self.status = "请等待撤销完成".to_string();
+            cx.notify();
+            return;
+        }
         if self.batch_rename_open {
             let base = self.batch_rename_input.read(cx).value().trim().to_string();
             let side = self.active_side;
@@ -2376,9 +2398,9 @@ impl FileFlowGpui {
             let targets = std::mem::take(&mut self.batch_rename_targets);
             self.batch_rename_open = false;
             window.focus(&self.focus_handle);
-            let undo_targets = targets.clone();
             self.status = format!("正在批量重命名 {} 项…", targets.len());
             cx.notify();
+            self.pending_file_operations += 1;
             let task = cx.background_executor().spawn(async move {
                 batch_rename_files(&targets, &base, start)
             });
@@ -2386,15 +2408,11 @@ impl FileFlowGpui {
                 let (renamed, errors) = task.await;
                 wait_out_of_ole_modal(cx).await;
                 let _ = this.update(cx, |this, cx| {
+                    this.pending_file_operations = this.pending_file_operations.saturating_sub(1);
                     let ok_count = renamed.len();
                     if !renamed.is_empty() {
-                        let mut undo_old = undo_targets;
-                        undo_old.truncate(renamed.len());
-                        let last_new = renamed.last().cloned();
-                        this.push_undo(UndoEntry::RenameBatch {
-                            from: renamed,
-                            to: undo_old,
-                        });
+                        let last_new = renamed.last().map(|item| item.from.clone());
+                        this.push_undo(UndoEntry::RenameBatch(renamed));
                         if let Some(last) = last_new {
                             this.set_single_selection(side, last);
                         }
@@ -2432,6 +2450,7 @@ impl FileFlowGpui {
             window.focus(&self.focus_handle);
             self.status = "正在重命名…".to_string();
             cx.notify();
+            self.pending_file_operations += 1;
             let task = cx.background_executor().spawn(async move {
                 operation.and_then(|(target, new_path)| {
                     if new_name.is_empty() {
@@ -2451,10 +2470,13 @@ impl FileFlowGpui {
                 let result = task.await;
                 wait_out_of_ole_modal(cx).await;
                 let _ = this.update(cx, |this, cx| {
+                    this.pending_file_operations = this.pending_file_operations.saturating_sub(1);
                     this.status = match result {
                         Ok(new_path) => {
                             this.set_single_selection(rename_side, new_path.clone());
-                            if let Some(old_path) = undo_rename_from {
+                            if let Some(old_path) = undo_rename_from
+                                && old_path != new_path
+                            {
                                 this.push_undo(UndoEntry::Rename {
                                     from: new_path,
                                     to: old_path,
@@ -2494,11 +2516,13 @@ impl FileFlowGpui {
             window.focus(&self.focus_handle);
             self.status = format!("正在新建{}…", kind.label());
             cx.notify();
+            self.pending_file_operations += 1;
             let task = cx.background_executor().spawn(async move { create_new_items(&base, &names, kind) });
             cx.spawn(async move |this, cx| {
                 let (created, errors) = task.await;
                 wait_out_of_ole_modal(cx).await;
                 let _ = this.update(cx, |this, cx| {
+                    this.pending_file_operations = this.pending_file_operations.saturating_sub(1);
                     if let Some(last) = created.last() {
                         this.set_single_selection(side, last.clone());
                     }
@@ -3138,15 +3162,19 @@ impl FileFlowGpui {
             return;
         };
         match entry {
-            UndoEntry::Move(_) | UndoEntry::Copy(_) => {
+            UndoEntry::Move(_) | UndoEntry::Copy(_) | UndoEntry::Rename { .. }
+                | UndoEntry::RenameBatch(_) | UndoEntry::RemoveNew(_) => {
                 self.undo_transfer_in_progress = true;
-                let label = if matches!(entry, UndoEntry::Move(_)) { "移动" } else { "复制" };
+                let label = entry.label();
                 self.status = format!("正在撤销{label}…");
                 cx.notify();
                 let task = cx.background_executor().spawn(async move {
                     match entry {
                         UndoEntry::Move(items) => undo_moved_items(items),
                         UndoEntry::Copy(paths) => undo_copied_items(paths),
+                        UndoEntry::Rename { from, to } => undo_renamed_items(vec![MoveRecord { from, to }]),
+                        UndoEntry::RenameBatch(items) => undo_renamed_items(items),
+                        UndoEntry::RemoveNew(paths) => undo_new_items(paths),
                         _ => unreachable!(),
                     }
                 });
@@ -3168,8 +3196,10 @@ impl FileFlowGpui {
                 }).detach();
             }
             UndoEntry::Restore(paths) => {
+                self.undo_transfer_in_progress = true;
                 self.status = format!("正在恢复 {} 项…", paths.len());
                 cx.notify();
+                let retry_paths = paths.clone();
                 let task = cx.background_executor().spawn(async move {
                     undo_recycle_restore(&paths)
                 });
@@ -3177,105 +3207,20 @@ impl FileFlowGpui {
                     let result = task.await;
                     wait_out_of_ole_modal(cx).await;
                     let _ = this.update(cx, |this, context| {
+                        this.undo_transfer_in_progress = false;
                         this.status = match result {
                             Ok(()) => "已从回收站恢复".to_string(),
-                            Err(error) => format!("恢复失败：{error}"),
+                            Err(error) => {
+                                this.push_undo(UndoEntry::Restore(retry_paths));
+                                format!("恢复失败：{error}")
+                            },
                         };
                         this.reload_visible_async(context);
                     });
                 })
                 .detach();
             }
-            UndoEntry::Rename { from, to } => {
-                self.status = "正在撤销重命名…".to_string();
-                cx.notify();
-                let task = cx.background_executor().spawn(async move {
-                    if !from.exists() {
-                        return Err(format!("原文件已不存在：{}", from.display()));
-                    }
-                    fs::rename(&from, &to)
-                        .map(|_| ())
-                        .map_err(|error| error.to_string())
-                });
-                cx.spawn(async move |this, cx| {
-                    let result = task.await;
-                    wait_out_of_ole_modal(cx).await;
-                    let _ = this.update(cx, |this, context| {
-                        this.status = match result {
-                            Ok(()) => "已撤销重命名".to_string(),
-                            Err(error) => format!("撤销重命名失败：{error}"),
-                        };
-                        this.reload_visible_async(context);
-                    });
-                })
-                .detach();
-            }
-            UndoEntry::RenameBatch { from, to } => {
-                self.status = format!("正在撤销批量重命名 {} 项…", from.len());
-                cx.notify();
-                // 两阶段：先全部改名到临时名避免互相占位，再改回原名
-                let task = cx.background_executor().spawn(async move {
-                    let mut failures = 0usize;
-                    for (index, path) in from.iter().enumerate() {
-                        let temp = path.with_file_name(format!(
-                            "__fileflow_batch_undo_{index}__{}",
-                            path.extension()
-                                .and_then(|e| e.to_str())
-                                .map(|e| format!(".{e}"))
-                                .unwrap_or_default()
-                        ));
-                        if fs::rename(path, &temp).is_ok() {
-                            if let Some(original) = to.get(index) {
-                                if fs::rename(&temp, original).is_err() {
-                                    failures += 1;
-                                }
-                            } else {
-                                let _ = fs::rename(&temp, path);
-                            }
-                        } else {
-                            failures += 1;
-                        }
-                    }
-                    failures
-                });
-                cx.spawn(async move |this, cx| {
-                    let failures = task.await;
-                    wait_out_of_ole_modal(cx).await;
-                    let _ = this.update(cx, |this, context| {
-                        this.status = if failures == 0 {
-                            "已撤销批量重命名".to_string()
-                        } else {
-                            format!("撤销批量重命名：{failures} 项失败")
-                        };
-                        this.reload_visible_async(context);
-                    });
-                })
-                .detach();
-            }
-            UndoEntry::RemoveNew(paths) => {
-                self.status = "正在撤销新建…".to_string();
-                cx.notify();
-                let task = cx.background_executor().spawn(async move {
-                    let mut removed = Vec::new();
-                    for path in &paths {
-                        if path.is_dir()
-                            && fs::remove_dir(path).is_ok()
-                        {
-                            removed.push(path.clone());
-                        }
-                    }
-                    removed
-                });
-                cx.spawn(async move |this, cx| {
-                    let removed = task.await;
-                    wait_out_of_ole_modal(cx).await;
-                    let _ = this.update(cx, |this, context| {
-                        this.status = format!("已撤销新建 {} 项", removed.len());
-                        this.reload_visible_async(context);
-                    });
-                })
-                .detach();
-            }
+
         }
     }
     fn on_view_details(&mut self, _: &ViewDetails, _: &mut Window, cx: &mut Context<Self>) {
@@ -3422,15 +3367,10 @@ impl FileFlowGpui {
         .detach();
     }
 
-    fn save_config(&self) {
+    fn save_config(&mut self) {
         let path = config_path();
-        let mut value = fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-            .unwrap_or_else(|| serde_json::json!({}));
-        let object = value
-            .as_object_mut()
-            .expect("configuration root must be an object");
+        let (mut value, _) = read_config_object(&path);
+        let object = value.as_object_mut().expect("read_config_object always returns an object");
         object.insert("split".into(), self.split.into());
         object.insert(
             "view_mode".into(),
@@ -3486,13 +3426,13 @@ impl FileFlowGpui {
             "shell_menu_third_party".into(),
             self.shell_menu_third_party.into(),
         );
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let _ = fs::write(
-            path,
-            serde_json::to_string_pretty(&value).unwrap_or_default(),
-        );
+        self.config_warning = match save_config_file(&path, &value) {
+            Ok(()) => None,
+            Err(error) => {
+                integration_log(&format!("config save failed: {error}"));
+                Some(format!("配置保存失败：{error}"))
+            }
+        };
     }
 
     fn window_buttons(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5826,6 +5766,41 @@ impl FileFlowGpui {
             )
     }
 
+    fn operation_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let message = self.config_warning.as_ref().map_or_else(
+            || self.status.clone(),
+            |warning| format!("{warning}　|　{}", self.status),
+        );
+        let busy = self.pending_file_operations > 0 || self.undo_transfer_in_progress;
+        let undo_label = self.undo_stack.last().map(|entry| format!("撤销{} · Ctrl+Z", entry.label()));
+        div().id("operation-status").h(px(30.)).flex_none().px_3().gap_3()
+            .flex().items_center().border_t_1().border_color(rgb(0xd9dfe3))
+            .bg(rgb(0xfafcfd)).text_sm().text_color(rgb(TEXT))
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
+            .on_mouse_up(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
+            .child(div().id("operation-message").flex_1().min_w(px(0.)).truncate()
+                .tooltip({
+                    let message = message.clone();
+                    move |_, cx| cx.new(|_| CrumbTooltip { text: message.clone() }).into()
+                })
+                .child(message))
+            .when(!busy && undo_label.is_some(), |bar| bar.child(
+                div().id("undo-last-operation").px_2().rounded_sm().cursor_pointer()
+                    .hover(|style| style.bg(rgb(HOVER_BLUE)))
+                    .child(undo_label.unwrap_or_default())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.on_undo(&Undo, window, cx);
+                    }))
+            ))
+            .child(div().id("dismiss-operation-message").px_2().cursor_pointer().child("×")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.status.clear();
+                    cx.notify();
+                })))
+    }
+
     fn new_folder_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("new-item-overlay")
@@ -7397,6 +7372,7 @@ impl Render for FileFlowGpui {
                         ),
                 ),
             )
+            .child(self.operation_status(cx))
             .when(self.new_folder_open, |root| {
                 root.child(self.new_folder_dialog(cx))
             })
@@ -8545,12 +8521,12 @@ fn unique_path(path: &Path) -> PathBuf {
 
 /// 批量重命名：按名称生成 `名称_001.ext`、`名称_002.ext`…
 /// 目标已存在的跳过（不覆盖），扩展名保留各自原有值。
-/// 返回 (成功的新路径列表, 失败原因列表)。
+/// 返回 (成功项的撤销路径对, 失败原因列表)。
 fn batch_rename_files(
     targets: &[PathBuf],
     base: &str,
     start: u32,
-) -> (Vec<PathBuf>, Vec<String>) {
+) -> (Vec<MoveRecord>, Vec<String>) {
     let mut renamed = Vec::new();
     let mut errors = Vec::new();
     if base.is_empty() {
@@ -8571,7 +8547,6 @@ fn batch_rename_files(
         };
         let new_path = parent.join(format!("{base}_{number:0width$}{extension}", width = width));
         if new_path == *target {
-            renamed.push(new_path);
             continue;
         }
         if new_path.exists() {
@@ -8582,7 +8557,7 @@ fn batch_rename_files(
             continue;
         }
         match fs::rename(target, &new_path) {
-            Ok(()) => renamed.push(new_path),
+            Ok(()) => renamed.push(MoveRecord { from: new_path, to: target.clone() }),
             Err(error) => errors.push(format!(
                 "{}：{error}",
                 target.file_name().unwrap_or_default().to_string_lossy()
@@ -10720,6 +10695,7 @@ fn app_key_bindings(bindings: &BTreeMap<String, String>) -> Vec<KeyBinding> {
 }
 
 struct SavedConfig {
+    warning: Option<String>,
     split: bool,
     view_mode: ViewMode,
     left_path: PathBuf,
@@ -10746,6 +10722,70 @@ fn config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("FileFlowEgui")
         .join("settings.json")
+}
+
+fn parse_config_object(bytes: &[u8]) -> Result<serde_json::Value, String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    if !value.is_object() { return Err("配置根节点必须是对象".to_string()); }
+    Ok(value)
+}
+
+fn read_config_object(path: &Path) -> (serde_json::Value, Option<String>) {
+    let primary = fs::read(path).map_err(|error| error.to_string())
+        .and_then(|bytes| parse_config_object(&bytes));
+    if let Ok(value) = primary { return (value, None); }
+    let backup = path.with_extension("json.bak");
+    if let Ok(value) = fs::read(&backup).map_err(|error| error.to_string())
+        .and_then(|bytes| parse_config_object(&bytes)) {
+        return (value, Some("配置读取失败，已使用上次备份".to_string()));
+    }
+    let warning = if path.exists() {
+        Some("配置格式有误，暂用默认设置；原文件将在保存时留存".to_string())
+    } else { None };
+    (serde_json::json!({}), warning)
+}
+
+/// 同目录临时文件写完并落盘后，Windows 原子替换目标；失败时原文件不动。
+fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    static NEXT_CONFIG_TEMP: AtomicUsize = AtomicUsize::new(0);
+    let parent = path.parent().ok_or("配置路径缺少目录")?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let sequence = NEXT_CONFIG_TEMP.fetch_add(1, AtomicOrdering::Relaxed);
+    let temp = path.with_extension(format!("tmp-{}-{sequence}", std::process::id()));
+    let mut file = OpenOptions::new().write(true).create_new(true).open(&temp)
+        .map_err(|error| error.to_string())?;
+    let written = file.write_all(bytes).and_then(|_| file.sync_all());
+    drop(file);
+    let result = written.map_err(|error| error.to_string()).and_then(|_| {
+        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+        let from: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } == 0 {
+            Err(std::io::Error::last_os_error().to_string())
+        } else { Ok(()) }
+    });
+    if result.is_err() { let _ = fs::remove_file(&temp); }
+    result
+}
+
+fn save_config_file(path: &Path, value: &serde_json::Value) -> Result<(), String> {
+    if !value.is_object() { return Err("配置根节点必须是对象".to_string()); }
+    let bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
+    match fs::read(path) {
+        Ok(old) if parse_config_object(&old).is_ok() => {
+            write_bytes_atomic(&path.with_extension("json.bak"), &old)?;
+        }
+        Ok(old) => {
+            // 不让损坏内容覆盖有效备份，另存一份供恢复。
+            let archive = path.with_extension(format!("invalid-{}.json", Local::now().format("%Y%m%d-%H%M%S-%f")));
+            let mut file = OpenOptions::new().write(true).create_new(true).open(archive)
+                .map_err(|error| error.to_string())?;
+            file.write_all(&old).and_then(|_| file.sync_all()).map_err(|error| error.to_string())?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(error) => return Err(error.to_string()),
+    }
+    write_bytes_atomic(path, &bytes)
 }
 
 fn integration_log(message: &str) {
@@ -10787,11 +10827,9 @@ fn config_path_value(value: &serde_json::Value, key: &str, fallback: &Path) -> P
 }
 
 fn load_config(fallback: &Path) -> SavedConfig {
-    let value = fs::read_to_string(config_path())
-        .ok()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .unwrap_or_default();
+    let (value, warning) = read_config_object(&config_path());
     SavedConfig {
+        warning,
         split: json_bool(&value, "split", false),
         view_mode: match value.get("view_mode").and_then(serde_json::Value::as_str) {
             Some("List") => ViewMode::List,
@@ -11126,27 +11164,46 @@ fn show_windows_shell_context_menu_with_owner(
                     }
                 };
 
-            // 多选：为每个选中项获取父文件夹内的相对 PIDL；单选直接用 child_pidl
+            // 多选：逐个 SHParseDisplayName + SHBindToParent 取各自在父文件夹内的
+            // 相对 PIDL。不能复用 parent_folder.ParseDisplayName——文件系统文件夹的
+            // ParseDisplayName 只认相对显示名，传绝对路径实测全部解析失败，
+            // 会走到"无法获取选中项的 Shell 标识"后 helper 直接退出、菜单不弹。
             let mut child_pidls: Vec<*const ITEMIDLIST> = Vec::new();
             if request.paths.len() > 1 {
                 for path in &request.paths {
                     let text = path.display().to_string();
                     let mut wide: Vec<u16> = text.encode_utf16().collect();
                     wide.push(0);
-                    let mut pidl: *mut ITEMIDLIST = ptr::null_mut();
-                    let parsed = parent_folder.ParseDisplayName(
-                        WHWND::default(),
+                    let mut absolute: *mut ITEMIDLIST = ptr::null_mut();
+                    let parsed = SHParseDisplayName(
+                        WPCWSTR(wide.as_ptr()),
                         None::<&IBindCtx>,
-                        WPCWSTR(wide.as_mut_ptr()),
+                        &mut absolute,
+                        0,
                         None,
-                        &mut pidl,
-                        ptr::null_mut(),
                     );
-                    if parsed.is_ok() && !pidl.is_null() {
-                        child_pidls.push(pidl);
-                        owned_pidls.push(pidl);
-                    } else if !pidl.is_null() {
-                        CoTaskMemFree(Some(pidl as _));
+                    if parsed.is_err() || absolute.is_null() {
+                        integration_log(&format!(
+                            "shell menu multi parse failed {text} hr={}",
+                            parsed.err().map(|e| e.code()).unwrap_or_default()
+                        ));
+                        continue;
+                    }
+                    let mut child: *mut ITEMIDLIST = ptr::null_mut();
+                    let bind_result = SHBindToParent::<IShellFolder>(absolute, Some(&mut child));
+                    if let Err(error) = &bind_result {
+                        integration_log(&format!(
+                            "shell menu multi bind failed {text} hr={}",
+                            error.code()
+                        ));
+                    }
+                    if bind_result.is_ok() && !child.is_null() {
+                        // child 是 absolute 内部的偏移（等价 ILFindLastID），
+                        // 不能单独释放，跟 absolute 一起进 owned_pidls
+                        child_pidls.push(child);
+                        owned_pidls.push(absolute);
+                    } else {
+                        CoTaskMemFree(Some(absolute as _));
                     }
                 }
             } else {
@@ -12107,6 +12164,12 @@ fn main() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         integration_log(&format!("PANIC: {info}"));
+        // panic 发生在 Win32 原生回调里时没有 RUST_BACKTRACE 也需要堆栈：
+        // async_context.rs 的 RefCell 双重借用只能靠调用链定位。
+        integration_log(&format!(
+            "PANIC BACKTRACE:\n{}",
+            std::backtrace::Backtrace::force_capture()
+        ));
         default_hook(info);
     }));
     let mut startup_args = std::env::args_os();
@@ -12119,7 +12182,7 @@ fn main() {
     }
     trim_thumbnail_cache();
     // 部署验证标记：升级后看 integration.log 是否出现本行即可确认运行的是新构建
-    integration_log("startup build 2026-10-07 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 maximize-v1 ime-selection-v1 internal-drag-v1 transfer-undo-v1");
+    integration_log("startup build 2026-10-07 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 maximize-v1 ime-selection-v1 internal-drag-v1 transfer-undo-v1 reliability-v1");
     let thumbnail_result_rx = start_thumbnail_worker();
     let (watch_command_tx, directory_change_rx) = start_directory_watcher();
     let external_path = external_path_from_args();
@@ -12131,11 +12194,7 @@ fn main() {
     // for targets such as Affinity and Adobe applications.
     let ole_initialized = unsafe { OleInitialize(None).is_ok() };
     let external_command_rx = start_external_command_listener();
-    let saved_win_e = fs::read_to_string(config_path())
-        .ok()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .map(|value| json_bool(&value, "win_e_enabled", false))
-        .unwrap_or(false);
+    let saved_win_e = json_bool(&read_config_object(&config_path()).0, "win_e_enabled", false);
     WIN_E_ENABLED.store(saved_win_e, AtomicOrdering::Relaxed);
     if saved_win_e {
         set_win_e_startup(true);
@@ -12532,9 +12591,9 @@ mod tests {
         let (renamed, errors) = batch_rename_files(&[a.clone(), b.clone(), c.clone()], "trip", 1);
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(renamed.len(), 3);
-        assert_eq!(renamed[0].file_name().unwrap(), "trip_001.jpg");
-        assert_eq!(renamed[1].file_name().unwrap(), "trip_002.png");
-        assert_eq!(renamed[2].file_name().unwrap(), "trip_003.txt");
+        assert_eq!(renamed[0].from.file_name().unwrap(), "trip_001.jpg");
+        assert_eq!(renamed[1].from.file_name().unwrap(), "trip_002.png");
+        assert_eq!(renamed[2].from.file_name().unwrap(), "trip_003.txt");
         // 目标名已存在时跳过不覆盖
         fs::write(dir.join("trip_001.log"), b"keep").unwrap();
         let source = dir.join("other.log");
@@ -12545,6 +12604,81 @@ mod tests {
         assert_eq!(fs::read(dir.join("trip_001.log")).unwrap(), b"keep");
         assert_eq!(fs::read(&source).unwrap(), b"x");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn reliability_test_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fileflow-{label}-{}-{}",
+            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn batch_rename_partial_success_undo_keeps_exact_original_pairs() {
+        let dir = reliability_test_dir("rename-pairs");
+        let paths: Vec<_> = ["a.txt", "b.txt", "c.txt"].iter().map(|name| dir.join(name)).collect();
+        for (index, path) in paths.iter().enumerate() { fs::write(path, [index as u8]).unwrap(); }
+        fs::write(dir.join("new_001.txt"), b"occupied").unwrap();
+        let (renamed, errors) = batch_rename_files(&paths, "new", 1);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(renamed.len(), 2);
+        assert_eq!(renamed[0].to, paths[1]);
+        assert_eq!(renamed[1].to, paths[2]);
+        // 新的同名文件不能被撤销覆盖，失败项仍可重试。
+        fs::write(&paths[1], b"keep-me").unwrap();
+        let result = undo_renamed_items(renamed);
+        assert_eq!(result.restored, 1);
+        assert_eq!(fs::read(&paths[1]).unwrap(), b"keep-me");
+        let Some(UndoEntry::RenameBatch(pending)) = result.remaining else { panic!("missing retry") };
+        assert_eq!(pending.len(), 1);
+        fs::remove_file(&paths[1]).unwrap();
+        let result = undo_renamed_items(pending);
+        assert_eq!(result.restored, 1);
+        assert!(result.errors.is_empty());
+        for (index, path) in paths.iter().enumerate() { assert_eq!(fs::read(path).unwrap(), [index as u8]); }
+        assert_eq!(fs::read(dir.join("new_001.txt")).unwrap(), b"occupied");
+        assert!(!dir.join("new_002.txt").exists() && !dir.join("new_003.txt").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn config_uses_valid_backup_and_preserves_invalid_original() {
+        let dir = reliability_test_dir("config-recovery");
+        let path = dir.join("settings.json");
+        let old = serde_json::json!({"favorites": ["C:\\"], "unknown_future_key": 42});
+        save_config_file(&path, &old).unwrap();
+        let updated = serde_json::json!({"favorites": ["D:\\"], "unknown_future_key": 42});
+        save_config_file(&path, &updated).unwrap();
+        assert_eq!(read_config_object(&path).0, updated);
+        assert_eq!(read_config_object(&path.with_extension("json.bak")).0, old);
+        for bad in ["[]", "null", "{broken-json"] {
+            fs::write(&path, bad).unwrap();
+            let (recovered, warning) = read_config_object(&path);
+            assert_eq!(recovered, old);
+            assert!(warning.is_some());
+            save_config_file(&path, &recovered).unwrap();
+            assert_eq!(read_config_object(&path).0, old);
+            assert!(fs::read_dir(&dir).unwrap().flatten().any(|entry| {
+                entry.file_name().to_string_lossy().contains("invalid-") && fs::read(entry.path()).unwrap() == bad.as_bytes()
+            }));
+        }
+        assert!(save_config_file(&path, &serde_json::json!([])).is_err());
+        assert_eq!(read_config_object(&path).0, old);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn atomic_config_replace_failure_preserves_current_file_and_cleans_temp() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = reliability_test_dir("config-locked");
+        let path = dir.join("settings.json");
+        fs::write(&path, b"original").unwrap();
+        let lock = OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+        assert!(write_bytes_atomic(&path, b"replacement").is_err());
+        drop(lock);
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
