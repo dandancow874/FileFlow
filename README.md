@@ -7,15 +7,20 @@ Windows 文件管理器，Rust + [gpui](https://github.com/zed-industries/zed)�
 ## 功能
 
 - **双栏分屏**浏览，标签页，前进/后退历史
-- **五种视图**：详情 / 列表 / 分栏 / 中·大·超大图标
+- **六种视图**：详情 / 列表 / 分栏 / 中·大·超大图标
 - **全视图虚拟化渲染**——上万文件的目录依然流畅滚动（uniform_list）
 - 文件夹大小**后台异步计算**并显示
 - 图片 / 视频**缩略图**（image crate 直解 + Windows Shell 管线覆盖 heic/psd 等）
-- 系统文件关联图标（zip/exe/pdf 真实图标，按扩展名缓存）
+- 中 / 大 / 超大图标视图下，文件夹显示内部第一张图片的缩略图
+- 系统文件关联图标；EXE 与快捷方式按文件路径读取各自的图标
+- **此电脑**显示磁盘容量、可用空间与用量；磁盘根目录返回上级进入此电脑
+- **Space 预览视频**：Windows Media Foundation 原生播放，支持播放/暂停、进度拖动和静音；格式支持取决于系统解码器
 - **拖拽**：应用内移动/复制（Ctrl）、拖出到其他程序（CF_HDROP + Shell IDataObject）
 - 拖框选择、Ctrl/Shift 多选、键盘导航、批量重命名（`名称_001` 序号模式）
 - **排序**：名称/类型/修改日期/大小，底栏点击循环切换、Ctrl+点击翻转升降序
-- Ctrl+Z 撤销（删除/重命名/新建）
+- 复制、剪切粘贴及应用内拖放遇到同名目标时，选择**覆盖 / 重命名 / 取消**；同目录复制保留自动生成副本
+- Ctrl+Z 撤销（移动/复制/覆盖/回收站删除/重命名/新建），撤销记录仅保留在当前运行会话
+- 覆盖前的原内容保存在 `%LOCALAPPDATA%\FileFlowEgui\overwrite-backups`；旧版工作目录中的撤销备份会自动迁移，非空备份保留
 - 右键菜单合并 **Windows Shell 原生菜单**（第三方扩展可用）
 - Win+E 接管（可选）、系统托盘、单实例
 - 标题栏拖动窗口、双击最大化/还原
@@ -32,7 +37,7 @@ Windows 文件管理器，Rust + [gpui](https://github.com/zed-industries/zed)�
 ## 构建
 
 ```bash
-git clone https://github.com/<你的用户名>/FileFlow.git
+git clone https://github.com/dandancow874/FileFlow.git
 cd FileFlow
 cargo build --release
 ```
