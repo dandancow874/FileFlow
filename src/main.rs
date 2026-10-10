@@ -2,6 +2,8 @@
 
 mod text_input;
 mod transfer_undo;
+mod video_preview;
+mod copy_conflict;
 use transfer_undo::{TransferProgress, MoveRecord, ShellOperationResult, undo_moved_items, undo_copied_items, undo_new_items, undo_renamed_items};
 
 use chrono::{DateTime, Local};
@@ -280,6 +282,9 @@ enum UndoEntry {
     Move(Vec<MoveRecord>),
     /// 复制：只撤销本次实际生成的副本。
     Copy(Vec<PathBuf>),
+    /// 覆盖复制：移除本次副本，再把原目标内容恢复。
+    ReplaceCopy { copied: Vec<PathBuf>, backups: Vec<MoveRecord> },
+    ReplaceMove { moved: Vec<MoveRecord>, backups: Vec<MoveRecord> },
     /// 删除（回收站）：恢复这些路径
     Restore(Vec<PathBuf>),
     /// 重命名：改回旧名
@@ -295,6 +300,8 @@ impl UndoEntry {
         match self {
             Self::Move(_) => "移动",
             Self::Copy(_) => "复制",
+            Self::ReplaceCopy { .. } => "覆盖复制",
+            Self::ReplaceMove { .. } => "覆盖移动",
             Self::Restore(_) => "删除",
             Self::Rename { .. } | Self::RenameBatch(_) => "重命名",
             Self::RemoveNew(_) => "新建",
@@ -530,6 +537,7 @@ struct FileFlowGpui {
     show_shortcuts: bool,
     left_preview_open: bool,
     right_preview_open: bool,
+    video_preview: Entity<video_preview::VideoPreview>,
     favorites: Vec<PathBuf>,
     recents: Vec<PathBuf>,
     recent_limit: usize,
@@ -672,6 +680,7 @@ impl FileFlowGpui {
             show_shortcuts: false,
             left_preview_open: false,
             right_preview_open: false,
+            video_preview: cx.new(|_| video_preview::VideoPreview::new()),
             favorites: saved.favorites,
             recents: saved.recents,
             recent_limit: saved.recent_limit,
@@ -3208,7 +3217,7 @@ impl FileFlowGpui {
             return;
         };
         match entry {
-            UndoEntry::Move(_) | UndoEntry::Copy(_) | UndoEntry::Rename { .. }
+            UndoEntry::Move(_) | UndoEntry::Copy(_) | UndoEntry::ReplaceCopy { .. } | UndoEntry::ReplaceMove { .. } | UndoEntry::Rename { .. }
                 | UndoEntry::RenameBatch(_) | UndoEntry::RemoveNew(_) => {
                 self.undo_transfer_in_progress = true;
                 let label = entry.label();
@@ -3218,6 +3227,8 @@ impl FileFlowGpui {
                     match entry {
                         UndoEntry::Move(items) => undo_moved_items(items),
                         UndoEntry::Copy(paths) => undo_copied_items(paths),
+                        UndoEntry::ReplaceCopy { copied, backups } => copy_conflict::undo_replaced_copy(copied, backups),
+                        UndoEntry::ReplaceMove { moved, backups } => copy_conflict::undo_replaced_move(moved, backups),
                         UndoEntry::Rename { from, to } => undo_renamed_items(vec![MoveRecord { from, to }]),
                         UndoEntry::RenameBatch(items) => undo_renamed_items(items),
                         UndoEntry::RemoveNew(paths) => undo_new_items(paths),
@@ -3385,7 +3396,11 @@ impl FileFlowGpui {
         cx.notify();
         let task = cx
             .background_executor()
-            .spawn(async move { perform_shell_file_operation(kind, &sources, target.as_deref(), None) });
+            .spawn(async move {
+                if matches!(kind, ShellOperationKind::Copy | ShellOperationKind::Move) && let Some(target) = target.as_deref() {
+                    copy_conflict::perform_user_transfer(kind, &sources, target)
+                } else { perform_shell_file_operation(kind, &sources, target.as_deref(), None) }
+            });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             wait_out_of_ole_modal(cx).await;
@@ -3393,11 +3408,18 @@ impl FileFlowGpui {
                 this.pending_file_operations = this.pending_file_operations.saturating_sub(1);
                 let moved_count = result.moved.len();
                 let copied_count = result.copied.len();
-                if copied_count > 0 {
-                    this.push_undo(UndoEntry::Copy(result.copied));
-                }
-                if moved_count > 0 {
-                    this.push_undo(UndoEntry::Move(result.moved));
+                let has_replacement = !result.replaced.is_empty();
+                if has_replacement && matches!(kind, ShellOperationKind::Move) {
+                    this.push_undo(UndoEntry::ReplaceMove { moved: result.moved, backups: result.replaced });
+                } else {
+                    if has_replacement {
+                        this.push_undo(UndoEntry::ReplaceCopy { copied: result.copied, backups: result.replaced });
+                    } else if copied_count > 0 {
+                        this.push_undo(UndoEntry::Copy(result.copied));
+                    }
+                    if moved_count > 0 {
+                        this.push_undo(UndoEntry::Move(result.moved));
+                    }
                 }
                 this.status = match result.result {
                     Ok(()) if matches!(kind, ShellOperationKind::Copy) => format!("已复制 {copied_count} 项，可按 Ctrl+Z 撤销"),
@@ -3405,6 +3427,8 @@ impl FileFlowGpui {
                     Ok(()) => format!("已{} {} 项", kind.progress_label(), count),
                     Err(error) if copied_count > 0 => format!("已复制 {copied_count} 项，可按 Ctrl+Z 撤销；其余操作未完成：{error}"),
                     Err(error) if moved_count > 0 => format!("已移动 {moved_count} 项，可按 Ctrl+Z 撤销；其余操作未完成：{error}"),
+                    Err(error) if has_replacement => format!("{}未完成：{error}；可按 Ctrl+Z 恢复原内容", kind.progress_label()),
+                    Err(error) if error == format!("已取消{}", kind.progress_label()) => error,
                     Err(error) => format!("{}失败：{}", kind.progress_label(), error),
                 };
                 this.reload_visible_async(cx);
@@ -6745,7 +6769,23 @@ impl FileFlowGpui {
             )
     }
 
-    fn preview_panel(&self, side: &'static str) -> impl IntoElement {
+    fn sync_video_preview(&self, cx: &mut Context<Self>) {
+        // Only the active pane plays video. Other pane previews remain available
+        // without starting a second decoder or overlapping audio.
+        let side = self.active_side;
+        let open = if side == "right" { self.split && self.right_preview_open } else { self.left_preview_open };
+        let (focused, selected) = if side == "right" {
+            (&self.right_focused, &self.right_selected)
+        } else { (&self.left_focused, &self.left_selected) };
+        let target = open.then(|| focused.as_ref().filter(|p| selected.contains(*p)).or_else(|| selected.iter().next()))
+            .flatten().filter(|p| video_preview::is_video_file(p) && self.entry_of(p).is_some_and(|e| !e.is_dir)).cloned();
+        let blocked = self.new_folder_open || self.rename_open || self.batch_rename_open || self.context_menu_open
+            || self.show_settings || self.show_shortcuts || self.type_filter_open || self.address_editing;
+        let parent = if target.is_some() { cached_or_find_fileflow_hwnd() as usize } else { 0 };
+        self.video_preview.update(cx, |video, cx| video.set_target(target, parent, blocked, cx));
+    }
+
+    fn preview_panel(&self, side: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = if side == "right" {
             self.right_focused
                 .as_ref()
@@ -6774,6 +6814,17 @@ impl FileFlowGpui {
                 .text_color(rgb(MUTED))
                 .child("文件夹预览")
                 .into_any_element(),
+            Some(path) if video_preview::is_video_file(path) => {
+                if self.active_side == side {
+                    div().flex_1().min_h(px(0.)).flex().child(self.video_preview.clone()).into_any_element()
+                } else {
+                    div().id(if side == "right" { "activate-right-video" } else { "activate-left-video" })
+                        .flex_1().p_4().cursor_pointer().text_color(rgb(MUTED)).child("点击此栏预览视频")
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation(); this.active_side = side; window.focus(&this.focus_handle); cx.notify();
+                        })).into_any_element()
+                }
+            }
             Some(path) if is_image_file(path) => img(path.clone())
                 .size_full()
                 .object_fit(ObjectFit::Contain)
@@ -7297,6 +7348,7 @@ impl FileFlowGpui {
 
 impl Render for FileFlowGpui {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_video_preview(cx);
         let left_path = self.current_path().to_path_buf();
         let right_path = self.right_path.clone();
         let left_query = self.filter_input.read(cx).value();
@@ -7452,7 +7504,7 @@ impl Render for FileFlowGpui {
                                         .child(self.entries_view(&left_entries, "left", cx))
                                         .child(self.status_bar("left", cx))
                                         .when(self.left_preview_open && self.split, |pane| {
-                                            pane.child(self.preview_panel("left"))
+                                            pane.child(self.preview_panel("left", cx))
                                         }),
                                 )
                                 .when(self.split, |layout| {
@@ -7469,12 +7521,12 @@ impl Render for FileFlowGpui {
                                             .child(self.entries_view(&right_entries, "right", cx))
                                             .child(self.status_bar("right", cx))
                                             .when(self.right_preview_open, |pane| {
-                                                pane.child(self.preview_panel("right"))
+                                                pane.child(self.preview_panel("right", cx))
                                             }),
                                     )
                                 })
                                 .when(self.left_preview_open && !self.split, |layout| {
-                                    layout.child(self.preview_panel("left"))
+                                    layout.child(self.preview_panel("left", cx))
                                 })
                                 .with_animation(
                                     ("view-fade", self.view_epoch),
@@ -7627,6 +7679,7 @@ fn read_entries(path: &Path) -> Vec<Entry> {
         }
         return vec![network_denied_entry(&server)];
     }
+    copy_conflict::request_legacy_backup_migration(path);
     let mut entries: Vec<_> = fs::read_dir(path)
         .ok()
         .into_iter()
@@ -8588,7 +8641,7 @@ fn perform_shell_file_operation(
     };
     let moved = std::mem::take(&mut *moved.lock().unwrap());
     let copied = std::mem::take(&mut *copied.lock().unwrap());
-    ShellOperationResult { result, moved, copied }
+    ShellOperationResult { result, moved, copied, replaced: Vec::new() }
 }
 
 unsafe fn run_file_operation_sta(
@@ -12503,7 +12556,7 @@ fn main() {
     }
     trim_thumbnail_cache();
     // 部署验证标记：升级后看 integration.log 是否出现本行即可确认运行的是新构建
-    integration_log("startup build 2026-10-10 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 maximize-v1 ime-selection-v1 internal-drag-v1 transfer-undo-v1 reliability-v1 alt-tab-drag-v1 folder-covers-v1 disk-capacity-v1 exe-icons-v1");
+    integration_log("startup build 2026-10-11 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 maximize-v1 ime-selection-v1 internal-drag-v1 transfer-undo-v1 reliability-v1 alt-tab-drag-v1 folder-covers-v1 disk-capacity-v1 exe-icons-v1 native-video-preview-v1 copy-move-conflicts-v1 overwrite-appdata-v1");
     let thumbnail_result_rx = start_thumbnail_worker();
     let folder_preview_rx = start_folder_preview_worker();
     let drive_info_rx = start_drive_info_worker();
@@ -12513,6 +12566,7 @@ fn main() {
     if !claim_single_instance_or_focus_existing(external_path.as_deref()) {
         return;
     }
+    copy_conflict::start_legacy_backup_migration();
     // OLE drag/drop requires the UI thread to live in an initialized STA for the
     // entire application lifetime. Initializing only when a drag begins is too late
     // for targets such as Affinity and Adobe applications.

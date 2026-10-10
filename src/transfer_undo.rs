@@ -20,6 +20,8 @@ pub(super) struct ShellOperationResult {
     pub result: Result<(), String>,
     pub moved: Vec<MoveRecord>,
     pub copied: Vec<PathBuf>,
+    /// 原目标内容所在的恢复路径（from），和它原来的位置（to）。
+    pub replaced: Vec<MoveRecord>,
 }
 
 pub(super) struct UndoResult {
