@@ -82,7 +82,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::NetworkManagement::NetManagement::NetApiBufferFree;
 use windows_sys::Win32::Storage::FileSystem::{
-    GetLogicalDrives, NetShareEnum, SHARE_INFO_1, STYPE_DISKTREE, STYPE_MASK,
+    GetLogicalDrives, GetDiskFreeSpaceExW, GetVolumeInformationW, NetShareEnum, SHARE_INFO_1, STYPE_DISKTREE, STYPE_MASK,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemInformation::GetTickCount;
@@ -121,6 +121,7 @@ const MUTED: u32 = 0x8A9299;
 const THIS_PC_PATH: &str = "This PC";
 const NETWORK_PATH: &str = "Network";
 const RECYCLE_BIN_PATH: &str = "Recycle Bin";
+const DRIVE_CARD_WIDTH: f32 = 280.;
 static WIN_E_ENABLED: AtomicBool = AtomicBool::new(false);
 /// DoDragDrop 原生模态循环进行中：gpui 后台任务必须暂缓 view.update，
 /// 否则对已借用的 App 再 borrow_mut 会 panic（async_context.rs RefCell）
@@ -149,6 +150,15 @@ static WIN_E_LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
 static TRAY_LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
 static FILEFLOW_HWND: AtomicIsize = AtomicIsize::new(0);
 static THUMBNAIL_REQUEST_TX: OnceLock<async_channel::Sender<PathBuf>> = OnceLock::new();
+static DRIVE_INFO_TX: OnceLock<async_channel::Sender<PathBuf>> = OnceLock::new();
+static DRIVE_INFO_PENDING: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+static DRIVE_INFO_MEMO: OnceLock<Mutex<HashMap<PathBuf, DriveInfo>>> = OnceLock::new();
+#[derive(Clone)]
+struct DriveInfo {
+    label: String,
+    space: Option<(u64, u64)>, // 可用、总容量
+    checked_at: Instant,
+}
 static FOLDER_PREVIEW_TX: OnceLock<async_channel::Sender<(PathBuf, u64)>> = OnceLock::new();
 static FOLDER_PREVIEW_PENDING: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 static FOLDER_PREVIEW_MEMO: OnceLock<Mutex<HashMap<PathBuf, FolderPreview>>> = OnceLock::new();
@@ -983,14 +993,16 @@ impl FileFlowGpui {
         } else {
             self.right_path.clone()
         };
-        let parent = origin.parent().map(|parent| parent.to_path_buf());
+        let parent = navigation_parent(&origin);
         if let Some(parent) = parent {
-            if side == "left" {
+            if is_virtual_path(&parent) {
+                self.open_virtual(side, parent, cx);
+            } else if side == "left" {
                 self.navigate_left(parent, cx);
             } else {
                 self.navigate_right(parent, cx);
             }
-            if !is_virtual_path(&origin) && origin.file_name().is_some() {
+            if !is_virtual_path(&origin) && (origin.file_name().is_some() || is_drive_root(&origin)) {
                 self.set_single_selection(side, origin);
             }
         }
@@ -1097,6 +1109,23 @@ impl FileFlowGpui {
             self.right_view_mode
         } else {
             self.left_view_mode
+        }
+    }
+
+    fn is_this_pc_side(&self, side: &'static str) -> bool {
+        is_this_pc(if side == "left" { self.current_path() } else { &self.right_path })
+    }
+
+    // “此电脑”使用固定磁盘卡片布局，普通目录继续保留各栏的查看方式。
+    fn layout_view_mode_for(&self, side: &'static str) -> ViewMode {
+        if self.is_this_pc_side(side) { ViewMode::MIcons } else { self.view_mode_for(side) }
+    }
+
+    fn entry_geometry(&self, side: &'static str, mode: ViewMode, pane_w: f32, count: usize) -> VirtualGridGeometry {
+        if self.is_this_pc_side(side) {
+            drive_grid_geometry(pane_w, count)
+        } else {
+            virtual_grid_geometry(mode, self.file_font_size, self.row_spacing, pane_w, count)
         }
     }
 
@@ -1451,7 +1480,7 @@ impl FileFlowGpui {
             .iter()
             .position(|entry| entry.path == path)
             .unwrap_or(target_index);
-        let view_mode = self.view_mode_for(self.active_side);
+        let view_mode = self.layout_view_mode_for(self.active_side);
         let scroll_index = entry_scroll_row(view_mode, arranged_index, self.grid_columns_for(self.active_side, view_mode));
         if self.active_side == "left" {
             self.left_scroll_handle.scroll_to_item(scroll_index, ScrollStrategy::Top);
@@ -1522,7 +1551,7 @@ impl FileFlowGpui {
         let current = focused
             .and_then(|path| entries.iter().position(|entry| entry.path == path))
             .unwrap_or(0);
-        let view_mode = self.view_mode_for(side);
+        let view_mode = self.layout_view_mode_for(side);
         let columns = self.grid_columns_for(side, view_mode);
         let next = if focused.is_none() { 0 } else {
             keyboard_selection_index(current, entries.len(), view_mode, columns, row_step, col_step)
@@ -1552,13 +1581,7 @@ impl FileFlowGpui {
             self.right_scroll_handle.0.borrow().base_handle.clone()
         };
         let viewport_width = f32::from(handle.bounds().size.width).max(1.);
-        let geo = virtual_grid_geometry(
-            view_mode,
-            self.file_font_size,
-            self.row_spacing,
-            viewport_width,
-            usize::MAX,
-        );
+        let geo = self.entry_geometry(side, view_mode, viewport_width, usize::MAX);
         geo.cols.max(1)
     }
 
@@ -1990,14 +2013,8 @@ impl FileFlowGpui {
         let origin_x = pixel_value(view_bounds.origin.x) - pixel_value(scroll_offset.x);
         let origin_y = pixel_value(view_bounds.origin.y) - pixel_value(scroll_offset.y);
         let pane_w = f32::from(view_bounds.size.width).max(1.);
-        let view_mode = self.view_mode_for(side);
-        let geo = virtual_grid_geometry(
-            view_mode,
-            self.file_font_size,
-            self.row_spacing,
-            pane_w,
-            visible_paths.len(),
-        );
+        let view_mode = self.layout_view_mode_for(side);
+        let geo = self.entry_geometry(side, view_mode, pane_w, visible_paths.len());
         for (index, path) in visible_paths.iter().enumerate() {
             let (l, t, r, b) = geo.cell_rect(index);
             // List/Details 退化分支 cell_w = pane_w、pad=0，天然正确
@@ -4159,7 +4176,7 @@ impl FileFlowGpui {
         side: &'static str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let view_mode = self.view_mode_for(side);
+        let view_mode = self.layout_view_mode_for(side);
         let scroll_handle = if side == "left" {
             self.left_scroll_handle.clone()
         } else {
@@ -4173,12 +4190,12 @@ impl FileFlowGpui {
             view_mode,
             ViewMode::MIcons | ViewMode::LIcons | ViewMode::XLIcons
         );
-        let tile = match view_mode {
+        let tile = if self.is_this_pc_side(side) { DRIVE_CARD_WIDTH } else { match view_mode {
             ViewMode::MIcons => 110.,
             ViewMode::LIcons => 160.,
             ViewMode::XLIcons => 220.,
             _ => 0.,
-        };
+        }};
         let list_row_h =
             (self.file_font_size * 1.42 + self.row_spacing).max(27. + self.row_spacing);
         // Details 列宽单一来源：与 entry_list_row / blank_details_cell 一致
@@ -4191,20 +4208,13 @@ impl FileFlowGpui {
             let view = cx.entity();
             let geo_view = cx.entity();
             let font_size = self.file_font_size;
-            let row_spacing = self.row_spacing;
             let load_thumbnails = self.load_thumbnails;
             let split = self.split;
             let view_mode_captured = view_mode;
             let tile_captured = tile;
             let visible_paths_for_rows = visible_paths.clone();
             let base_for_cols = base_scroll_handle.clone();
-            let geo = virtual_grid_geometry(
-                view_mode,
-                font_size,
-                row_spacing,
-                f32::from(base_for_cols.bounds().size.width).max(1.),
-                entries.len(),
-            );
+            let geo = self.entry_geometry(side, view_mode, f32::from(base_for_cols.bounds().size.width).max(1.), entries.len());
             let cols = geo.cols.max(1);
             let row_count = geo.rows();
             let cell_h = geo.cell_h.ceil();
@@ -5104,6 +5114,9 @@ impl FileFlowGpui {
         load_thumbnails: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if self.is_this_pc_side(side) {
+            return self.drive_card(side, index, entry, visible_paths, cx);
+        }
         let path = entry.path.clone();
         let menu_path = entry.path.clone();
         let is_dir = entry.is_dir;
@@ -5332,6 +5345,67 @@ impl FileFlowGpui {
                     this.finish_context_target(event.position, cx);
                 }),
             )
+            .into_any_element()
+    }
+
+    fn drive_card(&self, side: &'static str, index: usize, entry: &Entry, visible_paths: Vec<PathBuf>, cx: &mut Context<Self>) -> AnyElement {
+        let path = entry.path.clone();
+        let click_path = path.clone();
+        let drop_path = path.clone();
+        let down_path = path.clone();
+        let menu_path = path.clone();
+        let down_paths = visible_paths.clone();
+        let selected = self.is_selected(side, &path);
+        let drive = is_drive_root(&path);
+        let info = if drive { cached_drive_info(&path) } else { None };
+        let name = info.as_ref().map(|info| info.label.clone()).unwrap_or_else(|| entry.name.clone());
+        let space = info.as_ref().and_then(|info| info.space);
+        let text = if let Some((free, total)) = space {
+            format!("{} 可用，共 {}", format_disk_size(free), format_disk_size(total))
+        } else if drive {
+            if info.is_some() { "暂无法读取容量" } else { "正在读取容量…" }.to_string()
+        } else { String::new() };
+        let fraction = space.map_or(0., |(free, total)| drive_used_fraction(free, total));
+        div().id((if side == "left" { "drive-card-left" } else { "drive-card-right" }, index))
+            .w(px(DRIVE_CARD_WIDTH)).h(px(104.)).p_3().flex().items_center().gap_3().rounded_md()
+            .bg(rgb(if selected { HOVER_BLUE } else { 0xffffff }))
+            .hover(|style| style.bg(rgb(HOVER_BLUE)))
+            .child(if drive { drive_icon() } else { folder_icon(48.) })
+            .child(div().flex_1().min_w(px(0.)).flex().flex_col().gap_1()
+                .child(div().truncate().text_size(px(self.file_font_size)).child(name))
+                .when(drive, |body| body
+                    .child(div().w_full().h(px(13.)).bg(rgb(0xe5e5e5)).border_1().border_color(rgb(0xbac0c4))
+                        .child(div().h_full().w(gpui::relative(fraction)).bg(rgb(if fraction >= 0.9 { 0xc92b20 } else { 0x0078d4 }))))
+                    .child(div().truncate().text_size(px((self.file_font_size * 0.78).clamp(13., 16.))).text_color(rgb(MUTED)).child(text))))
+            .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                window.focus(&this.focus_handle);
+                this.select_entry(side, down_path.clone(), &down_paths, event.modifiers, cx);
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener({ let target = path.clone(); move |this, event: &MouseUpEvent, window, cx| {
+                cx.stop_propagation();
+                if !this.finish_file_drag(event, Some(target.clone()), window, cx) { this.finish_drag_select(event, window, cx); }
+            }}))
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                if this.suppress_blank_click { this.suppress_blank_click = false; return; }
+                if event.click_count() >= 2 && !event.modifiers().control && !event.modifiers().shift {
+                    this.set_single_selection(side, click_path.clone());
+                    this.open_selected(cx);
+                }
+            }))
+            .when(drive, |card| card.on_drop(cx.listener(move |this, payload: &FileDragPayload, window, cx| {
+                this.accept_file_drop(payload, &drop_path, window, cx);
+            })))
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                this.cancel_drag_select();
+                this.begin_context_target(side, menu_path.clone(), event.position, cx);
+            }))
+            .on_mouse_up(MouseButton::Right, cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                cx.stop_propagation();
+                this.finish_context_target(event.position, cx);
+            }))
             .into_any_element()
     }
 
@@ -7882,6 +7956,9 @@ fn virtual_entries(path: &Path) -> Vec<Entry> {
 }
 
 fn drive_entries() -> Vec<Entry> {
+    if let Ok(mut memo) = DRIVE_INFO_MEMO.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+        memo.clear();
+    }
     available_drives()
         .into_iter()
         .map(|path| {
@@ -7896,6 +7973,71 @@ fn drive_entries() -> Vec<Entry> {
             }
         })
         .collect()
+}
+
+fn is_drive_root(path: &Path) -> bool {
+    path.has_root() && path.parent().is_none()
+        && matches!(path.components().next(), Some(std::path::Component::Prefix(prefix))
+            if matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)))
+}
+
+fn navigation_parent(path: &Path) -> Option<PathBuf> {
+    if is_virtual_path(path) { return None; }
+    if is_drive_root(path) { Some(PathBuf::from(THIS_PC_PATH)) }
+    else { path.parent().filter(|parent| !parent.as_os_str().is_empty()).map(Path::to_path_buf) }
+}
+
+fn drive_used_fraction(free: u64, total: u64) -> f32 {
+    if total == 0 { 0. } else { total.saturating_sub(free) as f32 / total as f32 }
+}
+
+fn format_disk_size(bytes: u64) -> String {
+    if bytes >= 1 << 40 { format!("{:.2} TB", (bytes as f64 / (1u64 << 40) as f64 * 100.).floor() / 100.) }
+    else if bytes >= 1 << 30 { format!("{} GB", bytes / (1u64 << 30)) }
+    else { format_size(bytes) }
+}
+
+fn cached_drive_info(path: &Path) -> Option<DriveInfo> {
+    let info = DRIVE_INFO_MEMO.get_or_init(|| Mutex::new(HashMap::new())).lock().ok()
+        .and_then(|memo| memo.get(path).cloned());
+    if info.as_ref().is_none_or(|info| info.checked_at.elapsed() >= Duration::from_secs(30))
+        && let Some(sender) = DRIVE_INFO_TX.get()
+    {
+        let pending = DRIVE_INFO_PENDING.get_or_init(|| Mutex::new(HashSet::new()));
+        let queue = pending.lock().map(|mut set| set.insert(path.to_path_buf())).unwrap_or(false);
+        if queue && sender.try_send(path.to_path_buf()).is_err() && let Ok(mut set) = pending.lock() { set.remove(path); }
+    }
+    info
+}
+
+fn read_drive_info(path: &Path) -> DriveInfo {
+    let root: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut available = 0;
+    let mut total = 0;
+    let mut free = 0;
+    let mut label = [0u16; 261];
+    let space = unsafe { (GetDiskFreeSpaceExW(root.as_ptr(), &mut available, &mut total, &mut free) != 0)
+        .then_some((available, total)) };
+    let labeled = unsafe { GetVolumeInformationW(root.as_ptr(), label.as_mut_ptr(), label.len() as u32,
+        ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), 0) != 0 };
+    let volume = if labeled { String::from_utf16_lossy(&label[..label.iter().position(|&c| c == 0).unwrap_or(label.len())]) } else { String::new() };
+    let drive = path.to_string_lossy().trim_end_matches('\\').to_string();
+    DriveInfo { label: format!("{} ({drive})", if volume.is_empty() { "磁盘" } else { &volume }), space, checked_at: Instant::now() }
+}
+
+fn start_drive_info_worker() -> async_channel::Receiver<PathBuf> {
+    let (tx, rx) = async_channel::bounded::<PathBuf>(32);
+    let (done_tx, done_rx) = async_channel::bounded::<PathBuf>(32);
+    let _ = DRIVE_INFO_TX.set(tx);
+    thread::spawn(move || {
+        while let Ok(path) = rx.recv_blocking() {
+            let info = read_drive_info(&path);
+            if let Ok(mut memo) = DRIVE_INFO_MEMO.get_or_init(|| Mutex::new(HashMap::new())).lock() { memo.insert(path.clone(), info); }
+            if let Ok(mut pending) = DRIVE_INFO_PENDING.get_or_init(|| Mutex::new(HashSet::new())).lock() { pending.remove(&path); }
+            let _ = done_tx.send_blocking(path);
+        }
+    });
+    done_rx
 }
 
 fn breadcrumb_paths(path: &Path) -> Vec<(String, PathBuf)> {
@@ -8103,6 +8245,14 @@ fn folder_icon(size: f32) -> AnyElement {
                 .border_1()
                 .border_color(rgb(0xe2aa22)),
         )
+        .into_any_element()
+}
+
+fn drive_icon() -> AnyElement {
+    div().relative().w(px(48.)).h(px(32.)).rounded_sm().bg(rgb(0x9ca4aa))
+        .border_1().border_color(rgb(0x727c83))
+        .child(div().absolute().top(px(0.)).w_full().h(px(19.)).rounded_t_sm().bg(rgb(0xdce0e3)))
+        .child(div().absolute().bottom(px(5.)).left(px(6.)).w(px(5.)).h(px(5.)).rounded_full().bg(rgb(0x32c850)))
         .into_any_element()
 }
 
@@ -11048,6 +11198,13 @@ pub(crate) struct VirtualGridGeometry {
     pub count: usize,
 }
 
+fn drive_grid_geometry(pane_w: f32, count: usize) -> VirtualGridGeometry {
+    VirtualGridGeometry {
+        cols: (((pane_w - 16. + 8.) / (DRIVE_CARD_WIDTH + 8.)).floor() as usize).max(1),
+        cell_w: DRIVE_CARD_WIDTH, cell_h: 104., stride_x: DRIVE_CARD_WIDTH + 8., stride_y: 112., pad: 8., count,
+    }
+}
+
 impl VirtualGridGeometry {
     pub fn rows(&self) -> usize {
         if self.cols == 0 {
@@ -12307,9 +12464,10 @@ fn main() {
     }
     trim_thumbnail_cache();
     // 部署验证标记：升级后看 integration.log 是否出现本行即可确认运行的是新构建
-    integration_log("startup build 2026-10-07 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 maximize-v1 ime-selection-v1 internal-drag-v1 transfer-undo-v1 reliability-v1 alt-tab-drag-v1");
+    integration_log("startup build 2026-10-10 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 maximize-v1 ime-selection-v1 internal-drag-v1 transfer-undo-v1 reliability-v1 alt-tab-drag-v1 folder-covers-v1 disk-capacity-v1");
     let thumbnail_result_rx = start_thumbnail_worker();
     let folder_preview_rx = start_folder_preview_worker();
+    let drive_info_rx = start_drive_info_worker();
     let (watch_command_tx, directory_change_rx) = start_directory_watcher();
     let external_path = external_path_from_args();
     if !claim_single_instance_or_focus_existing(external_path.as_deref()) {
@@ -12360,6 +12518,7 @@ fn main() {
         start_directory_change_pump(view.clone(), directory_change_rx, cx);
         start_thumbnail_result_pump(view.clone(), thumbnail_result_rx, cx);
         start_thumbnail_result_pump(view.clone(), folder_preview_rx, cx);
+        start_thumbnail_result_pump(view.clone(), drive_info_rx, cx);
         start_thumbnail_result_pump(view.clone(), ui_refresh_rx, cx);
         let folder_size_done_rx = start_folder_size_worker();
         start_thumbnail_result_pump(view.clone(), folder_size_done_rx, cx);
@@ -12806,6 +12965,34 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"original");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn disk_root_parent_returns_this_pc_and_preserves_normal_parent_navigation() {
+        for root in ["C:\\", "F:\\", "f:\\", "\\\\?\\F:\\"] {
+            assert!(is_drive_root(Path::new(root)));
+            assert_eq!(navigation_parent(Path::new(root)), Some(PathBuf::from(THIS_PC_PATH)));
+        }
+        assert_eq!(navigation_parent(Path::new("F:\\photos")), Some(PathBuf::from("F:\\")));
+        assert_eq!(navigation_parent(Path::new("F:\\photos\\2026")), Some(PathBuf::from("F:\\photos")));
+        assert!(navigation_parent(Path::new(THIS_PC_PATH)).is_none());
+        assert!(!is_drive_root(Path::new("\\\\server\\share\\")));
+    }
+
+    #[test]
+    fn disk_capacity_labels_and_grid_match_actual_units_and_navigation() {
+        assert_eq!(format_disk_size(2_000_000_000_000), "1.81 TB");
+        assert_eq!(format_disk_size(1u64 << 30), "1 GB");
+        assert_eq!(drive_used_fraction(0, 0), 0.);
+        assert_eq!(drive_used_fraction(100, 100), 0.);
+        assert_eq!(drive_used_fraction(0, 100), 1.);
+        assert_eq!(drive_used_fraction(200, 100), 0.);
+        let geo = drive_grid_geometry(1000., 6);
+        assert_eq!(geo.cols, 3);
+        assert_eq!(geo.rows(), 2);
+        assert_eq!(geo.cell_rect(3), (8., 120., 288., 224.));
+        assert_eq!(entry_scroll_row(ViewMode::MIcons, 3, geo.cols), 1);
+        assert_eq!(keyboard_selection_index(0, 6, ViewMode::MIcons, geo.cols, 1, 0), 3);
     }
 
     #[test]
