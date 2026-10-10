@@ -184,6 +184,8 @@ static PATH_STATUS_PENDING: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 /// 文件类型图标的会话级记忆：(扩展名, 尺寸桶) → PNG 路径（None=提取失败，不重试）
 type FiletypeIconMemo = Mutex<HashMap<(String, u32), Option<PathBuf>>>;
 static FILETYPE_ICON_MEMO: OnceLock<FiletypeIconMemo> = OnceLock::new();
+static EXE_ICON_TX: OnceLock<async_channel::Sender<(PathBuf, u32)>> = OnceLock::new();
+static EXE_ICON_PENDING: OnceLock<Mutex<HashSet<(String, u32)>>> = OnceLock::new();
 /// 缩略图缓存盘上是否已存在的会话级记忆（渲染帧不反复 stat）；
 /// 后台生成成功后由 worker 置 true
 static THUMBNAIL_CACHE_MEMO: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
@@ -8848,6 +8850,17 @@ fn cached_filetype_icon_path(path: &Path, size: f32) -> Option<PathBuf> {
     {
         return hit.clone();
     }
+    // 查询真实 EXE 会读取资源（大安装包/网络目录可能很慢），不要在渲染线程执行。
+    if extension == "exe" && let Some(sender) = EXE_ICON_TX.get() {
+        let pending = EXE_ICON_PENDING.get_or_init(|| Mutex::new(HashSet::new()));
+        let queue = pending.lock().map(|mut set| set.insert(memo_key.clone())).unwrap_or(false);
+        if queue && sender.try_send((path.to_path_buf(), bucket)).is_err()
+            && let Ok(mut set) = pending.lock()
+        {
+            set.remove(&memo_key);
+        }
+        return None;
+    }
     let computed = filetype_icon_png(&extension, bucket, path);
     if let Ok(mut map) = memo.lock() {
         map.insert(memo_key, computed.clone());
@@ -8855,13 +8868,37 @@ fn cached_filetype_icon_path(path: &Path, size: f32) -> Option<PathBuf> {
     computed
 }
 
-// LNK 的图标属于单个快捷方式，不能按扩展名共享（也避免复用旧通用缓存）。
+// LNK/EXE 的图标属于单个文件，不能按扩展名共享（也避免复用旧通用缓存）。
 fn filetype_icon_identity(extension: &str, path: &Path) -> String {
     if extension == "lnk" {
         format!("shortcut-v1:{}", path.to_string_lossy().to_lowercase())
+    } else if extension == "exe" {
+        format!("executable-v1:{}", path.to_string_lossy().to_lowercase())
     } else {
         extension.to_string()
     }
+}
+
+fn start_exe_icon_worker() -> async_channel::Receiver<PathBuf> {
+    let (tx, rx) = async_channel::bounded::<(PathBuf, u32)>(64);
+    let (done_tx, done_rx) = async_channel::bounded::<PathBuf>(64);
+    let _ = EXE_ICON_TX.set(tx);
+    thread::spawn(move || {
+        let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
+        while let Ok((path, bucket)) = rx.recv_blocking() {
+            let key = (filetype_icon_identity("exe", &path), bucket);
+            let icon = filetype_icon_png("exe", bucket, &path);
+            if let Ok(mut memo) = FILETYPE_ICON_MEMO.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+                memo.insert(key.clone(), icon);
+            }
+            if let Ok(mut pending) = EXE_ICON_PENDING.get_or_init(|| Mutex::new(HashSet::new())).lock() {
+                pending.remove(&key);
+            }
+            let _ = done_tx.send_blocking(path);
+        }
+        if initialized { unsafe { CoUninitialize() }; }
+    });
+    done_rx
 }
 /// 磁盘缓存 + 提取。失败也由调用方记住（memo），本会话不重试。
 fn filetype_icon_png(extension: &str, bucket: u32, path: &Path) -> Option<PathBuf> {
@@ -8883,9 +8920,11 @@ fn filetype_icon_png(extension: &str, bucket: u32, path: &Path) -> Option<PathBu
     unsafe {
         let mut wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         let mut info = SHFILEINFOW::default();
-        // 快捷方式必须查询真实路径，让 Shell 解析目标/自定义图标。
+        // 快捷方式解析目标/自定义图标，EXE 读取自身资源；都必须查询真实文件。
         let flags = if extension == "lnk" {
             SHGFI_ICON | SHGFI_LARGEICON | SHGFI_LINKOVERLAY
+        } else if extension == "exe" {
+            SHGFI_ICON | SHGFI_LARGEICON
         } else {
             SHGFI_ICON | SHGFI_USEFILEATTRIBUTES | SHGFI_LARGEICON
         };
@@ -12464,10 +12503,11 @@ fn main() {
     }
     trim_thumbnail_cache();
     // 部署验证标记：升级后看 integration.log 是否出现本行即可确认运行的是新构建
-    integration_log("startup build 2026-10-10 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 maximize-v1 ime-selection-v1 internal-drag-v1 transfer-undo-v1 reliability-v1 alt-tab-drag-v1 folder-covers-v1 disk-capacity-v1");
+    integration_log("startup build 2026-10-10 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 maximize-v1 ime-selection-v1 internal-drag-v1 transfer-undo-v1 reliability-v1 alt-tab-drag-v1 folder-covers-v1 disk-capacity-v1 exe-icons-v1");
     let thumbnail_result_rx = start_thumbnail_worker();
     let folder_preview_rx = start_folder_preview_worker();
     let drive_info_rx = start_drive_info_worker();
+    let exe_icon_rx = start_exe_icon_worker();
     let (watch_command_tx, directory_change_rx) = start_directory_watcher();
     let external_path = external_path_from_args();
     if !claim_single_instance_or_focus_existing(external_path.as_deref()) {
@@ -12519,6 +12559,7 @@ fn main() {
         start_thumbnail_result_pump(view.clone(), thumbnail_result_rx, cx);
         start_thumbnail_result_pump(view.clone(), folder_preview_rx, cx);
         start_thumbnail_result_pump(view.clone(), drive_info_rx, cx);
+        start_thumbnail_result_pump(view.clone(), exe_icon_rx, cx);
         start_thumbnail_result_pump(view.clone(), ui_refresh_rx, cx);
         let folder_size_done_rx = start_folder_size_worker();
         start_thumbnail_result_pump(view.clone(), folder_size_done_rx, cx);
@@ -13095,6 +13136,20 @@ mod tests {
     /// 回归：filetype 图标必须落盘缓存。曾因 GetDIBits 查询头（预置
     /// biBitCount=32 的 cLines=0 调用）恒返回 0，缓存永远写不进去，
     /// 每帧对每个文件重新提取，大目录（900+ 项）卡到秒级。
+    #[test]
+    fn executables_use_their_own_embedded_icons_and_distinct_cache_files() {
+        let windows_dir = PathBuf::from(std::env::var_os("WINDIR").expect("Windows directory"));
+        let explorer = windows_dir.join("explorer.exe");
+        let command = windows_dir.join("System32").join("cmd.exe");
+        assert_ne!(filetype_icon_identity("exe", &explorer), "exe", "must invalidate extension-wide cache");
+        let first = cached_filetype_icon_path(&explorer, 70.).expect("Explorer icon");
+        let second = cached_filetype_icon_path(&command, 70.).expect("Command Prompt icon");
+        assert_ne!(first, second);
+        assert_ne!(image::open(&first).unwrap().to_rgba8(), image::open(&second).unwrap().to_rgba8(),
+            "different EXEs must use their actual icon content");
+        assert_eq!(cached_filetype_icon_path(&explorer, 70.), Some(first));
+    }
+
     #[test]
     fn filetype_icon_cache_persists_png() {
         let icon = cached_filetype_icon_path(Path::new(r"C://probe-not-exist.zip"), 70.)
