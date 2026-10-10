@@ -149,6 +149,15 @@ static WIN_E_LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
 static TRAY_LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
 static FILEFLOW_HWND: AtomicIsize = AtomicIsize::new(0);
 static THUMBNAIL_REQUEST_TX: OnceLock<async_channel::Sender<PathBuf>> = OnceLock::new();
+static FOLDER_PREVIEW_TX: OnceLock<async_channel::Sender<(PathBuf, u64)>> = OnceLock::new();
+static FOLDER_PREVIEW_PENDING: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+static FOLDER_PREVIEW_MEMO: OnceLock<Mutex<HashMap<PathBuf, FolderPreview>>> = OnceLock::new();
+
+struct FolderPreview {
+    modified_millis: u64,
+    checked_at: Instant,
+    thumbnail: Option<PathBuf>,
+}
 /// 文件夹递归大小缓存（后台算完写入，渲染零 IO）
 static FOLDER_SIZE_CACHE: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
 /// 文件夹大小计算请求通道（去重由 worker 侧 pending 集合保证）
@@ -716,6 +725,10 @@ impl FileFlowGpui {
             return;
         }
 
+        // 重新打开/刷新父目录时也重新检查子文件夹封面（文件内容修改不一定改变目录时间）。
+        if let Ok(mut memo) = FOLDER_PREVIEW_MEMO.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+            memo.retain(|folder, _| folder.parent() != Some(path.as_path()));
+        }
         let generation = if side == "right" {
             self.right_load_generation = self.right_load_generation.wrapping_add(1);
             self.right_load_generation
@@ -5143,7 +5156,11 @@ impl FileFlowGpui {
                 file_icon(fallback_size)
             }
         } else if is_dir {
-            folder_icon(icon_size)
+            if load_thumbnails && matches!(view_mode, ViewMode::MIcons | ViewMode::LIcons | ViewMode::XLIcons) {
+                folder_preview_icon(icon_size, cached_folder_preview(&path, entry.modified_millis))
+            } else {
+                folder_icon(icon_size)
+            }
         } else if let Some(type_icon) = cached_filetype_icon_path(&path, icon_size) {
             // 系统文件关联图标（zip/exe/pdf 等真实图标），按扩展名缓存
             let fallback_size = icon_size * 0.82;
@@ -8089,6 +8106,42 @@ fn folder_icon(size: f32) -> AnyElement {
         .into_any_element()
 }
 
+/// 预览夹在后板和前袋之间，保持文件夹轮廓；只用于大图标。
+fn folder_preview_icon(size: f32, thumbnail: Option<PathBuf>) -> AnyElement {
+    let Some(thumbnail) = thumbnail else {
+        return folder_icon(size);
+    };
+    div()
+        .relative()
+        .w(px(size))
+        .h(px(size * 0.76))
+        .child(folder_icon(size))
+        .child(
+            div()
+                .absolute()
+                .left(px(size * 0.04))
+                .top(px(size * 0.18))
+                .w(px(size * 0.92))
+                .h(px(size * 0.48))
+                .rounded_sm()
+                .overflow_hidden()
+                .child(img(thumbnail).size_full().object_fit(ObjectFit::Cover)
+                    .with_fallback(|| div().size_full().into_any_element())),
+        )
+        .child(
+            div()
+                .absolute()
+                .bottom(px(0.))
+                .w(px(size))
+                .h(px(size * 0.30))
+                .rounded_sm()
+                .bg(rgb(0xffda68))
+                .border_1()
+                .border_color(rgb(0xe2aa22)),
+        )
+        .into_any_element()
+}
+
 fn file_icon(size: f32) -> AnyElement {
     div()
         .relative()
@@ -8972,6 +9025,59 @@ fn shell_thumbnail(source: &Path) -> Option<image::DynamicImage> {
         unsafe { CoUninitialize() };
     }
     outcome
+}
+
+/// 渲染只查内存和入队。独立的有界 worker 防止网络文件夹阻塞普通图片缩略图。
+fn cached_folder_preview(folder: &Path, modified_millis: u64) -> Option<PathBuf> {
+    if is_virtual_path(folder) {
+        return None;
+    }
+    let (thumbnail, fresh) = FOLDER_PREVIEW_MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock().ok().and_then(|memo| memo.get(folder).map(|preview| {
+            (preview.thumbnail.clone(), preview.modified_millis == modified_millis
+                && preview.checked_at.elapsed() < Duration::from_secs(30))
+        })).unwrap_or((None, false));
+    if !fresh && let Some(sender) = FOLDER_PREVIEW_TX.get() {
+        let pending = FOLDER_PREVIEW_PENDING.get_or_init(|| Mutex::new(HashSet::new()));
+        let should_queue = pending.lock().map(|mut set| set.insert(folder.to_path_buf())).unwrap_or(false);
+        if should_queue && sender.try_send((folder.to_path_buf(), modified_millis)).is_err()
+            && let Ok(mut set) = pending.lock()
+        {
+            set.remove(folder);
+        }
+    }
+    thumbnail
+}
+
+/// 只读直属文件：不递归、不跟随目录链接。排序不受 read_dir 返回顺序影响。
+fn generate_folder_preview(folder: &Path) -> Option<PathBuf> {
+    let mut images: Vec<PathBuf> = fs::read_dir(folder).ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| is_image_file(&entry.path())
+            && entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.path()).collect();
+    images.sort_by_cached_key(|path| (path.file_name().unwrap_or_default().to_string_lossy().to_lowercase(), path.clone()));
+    images.iter().find_map(|source| generate_cached_thumbnail(source))
+}
+
+fn start_folder_preview_worker() -> async_channel::Receiver<PathBuf> {
+    let (request_tx, request_rx) = async_channel::bounded::<(PathBuf, u64)>(64);
+    let (result_tx, result_rx) = async_channel::bounded::<PathBuf>(64);
+    let _ = FOLDER_PREVIEW_TX.set(request_tx);
+    thread::spawn(move || {
+        while let Ok((folder, modified_millis)) = request_rx.recv_blocking() {
+            let thumbnail = generate_folder_preview(&folder);
+            // 无图片/无法读取也缓存，避免每帧扫描空目录；下次刷新或过期可重试。
+            if let Ok(mut memo) = FOLDER_PREVIEW_MEMO.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+                memo.insert(folder.clone(), FolderPreview { modified_millis, checked_at: Instant::now(), thumbnail });
+            }
+            if let Ok(mut pending) = FOLDER_PREVIEW_PENDING.get_or_init(|| Mutex::new(HashSet::new())).lock() {
+                pending.remove(&folder);
+            }
+            let _ = result_tx.send_blocking(folder);
+        }
+    });
+    result_rx
 }
 
 fn start_thumbnail_worker() -> async_channel::Receiver<PathBuf> {
@@ -12203,6 +12309,7 @@ fn main() {
     // 部署验证标记：升级后看 integration.log 是否出现本行即可确认运行的是新构建
     integration_log("startup build 2026-10-07 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 maximize-v1 ime-selection-v1 internal-drag-v1 transfer-undo-v1 reliability-v1 alt-tab-drag-v1");
     let thumbnail_result_rx = start_thumbnail_worker();
+    let folder_preview_rx = start_folder_preview_worker();
     let (watch_command_tx, directory_change_rx) = start_directory_watcher();
     let external_path = external_path_from_args();
     if !claim_single_instance_or_focus_existing(external_path.as_deref()) {
@@ -12252,6 +12359,7 @@ fn main() {
         start_external_command_pump(window, view.clone(), external_command_rx, cx);
         start_directory_change_pump(view.clone(), directory_change_rx, cx);
         start_thumbnail_result_pump(view.clone(), thumbnail_result_rx, cx);
+        start_thumbnail_result_pump(view.clone(), folder_preview_rx, cx);
         start_thumbnail_result_pump(view.clone(), ui_refresh_rx, cx);
         let folder_size_done_rx = start_folder_size_worker();
         start_thumbnail_result_pump(view.clone(), folder_size_done_rx, cx);
@@ -12698,6 +12806,32 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"original");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn folder_preview_uses_first_decodable_direct_image_and_tracks_changes() {
+        let folder = std::env::temp_dir().join(format!("fileflow-folder-preview-{}", std::process::id()));
+        fs::create_dir_all(folder.join("nested")).unwrap();
+        let save = |path: &Path, color: [u8; 4], width| {
+            image::RgbaImage::from_pixel(width, 12, image::Rgba(color)).save(path).unwrap();
+        };
+        save(&folder.join("nested/00-nested.png"), [0, 0, 255, 255], 24);
+        assert!(generate_folder_preview(&folder).is_none(), "must not scan nested folders");
+        fs::write(folder.join("00-broken.png"), b"invalid image").unwrap();
+        save(&folder.join("Z-last.png"), [0, 255, 0, 255], 24);
+        save(&folder.join("A-first.png"), [255, 0, 0, 255], 24);
+        let first = generate_folder_preview(&folder).unwrap();
+        assert_eq!(image::open(&first).unwrap().to_rgba8().get_pixel(0, 0).0, [255, 0, 0, 255]);
+        save(&folder.join("A-first.png"), [255, 255, 0, 255], 48);
+        let updated = generate_folder_preview(&folder).unwrap();
+        assert_ne!(first, updated, "replaced image must not reuse stale thumbnail");
+        assert_eq!(image::open(&updated).unwrap().to_rgba8().get_pixel(0, 0).0, [255, 255, 0, 255]);
+        fs::remove_file(folder.join("A-first.png")).unwrap();
+        let next = generate_folder_preview(&folder).unwrap();
+        assert_eq!(image::open(&next).unwrap().to_rgba8().get_pixel(0, 0).0, [0, 255, 0, 255]);
+        fs::remove_file(folder.join("Z-last.png")).unwrap();
+        assert!(generate_folder_preview(&folder).is_none());
+        fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]
