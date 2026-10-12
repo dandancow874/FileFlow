@@ -8435,7 +8435,18 @@ fn inline_file_icon(path: &Path, size: f32) -> AnyElement {
     }
 }
 
+// Filesystem APIs accept mixed separators, but the Shell parser can return
+// E_INVALIDARG for an Eagle CF_HDROP path such as `E:\library\item.info/image.png`.
+// Preserve UTF-16 names; only normalize the separator before Shell integration.
+fn normalize_shell_path(path: &Path) -> PathBuf {
+    let wide: Vec<u16> = path.as_os_str().encode_wide()
+        .map(|unit| if unit == b'/' as u16 { b'\\' as u16 } else { unit })
+        .collect();
+    PathBuf::from(std::ffi::OsString::from_wide(&wide))
+}
+
 fn shell_item_from_path(path: &Path) -> WResult<IShellItem> {
+    let path = normalize_shell_path(path);
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     unsafe { SHCreateItemFromParsingName(WPCWSTR(wide.as_ptr()), None::<&IBindCtx>) }
 }
@@ -12108,6 +12119,7 @@ fn put_files_on_windows_clipboard(files: &[PathBuf], effect: DROPEFFECT) -> Resu
 }
 
 fn put_shell_files_on_clipboard(files: &[PathBuf], effect: DROPEFFECT) -> Result<(), String> {
+    let files: Vec<_> = files.iter().map(|path| normalize_shell_path(path)).collect();
     let Some(parent) = files.first().and_then(|path| path.parent()) else {
         return Err("无法确定文件所在目录".to_string());
     };
@@ -12137,7 +12149,7 @@ fn put_shell_files_on_clipboard(files: &[PathBuf], effect: DROPEFFECT) -> Result
             allocated_pidls.push(parent_pidl);
 
             let mut child_pidls = Vec::with_capacity(files.len());
-            for path in files {
+            for path in &files {
                 let mut path_wide: Vec<u16> =
                     path.as_os_str().encode_wide().chain(Some(0)).collect();
                 let mut absolute_pidl = ptr::null_mut();
@@ -12291,9 +12303,9 @@ fn files_from_windows_clipboard() -> Result<(Vec<PathBuf>, bool), String> {
                 let length = DragQueryFileW(hdrop, index, None) as usize;
                 let mut buffer = vec![0u16; length + 1];
                 let written = DragQueryFileW(hdrop, index, Some(&mut buffer)) as usize;
-                paths.push(PathBuf::from(std::ffi::OsString::from_wide(
+                paths.push(normalize_shell_path(&PathBuf::from(std::ffi::OsString::from_wide(
                     &buffer[..written],
-                )));
+                ))));
             }
             let format_name: Vec<u16> = "Preferred DropEffect"
                 .encode_utf16()
@@ -13028,6 +13040,69 @@ mod tests {
             std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn shell_accepts_mixed_separator_clipboard_paths() {
+        let dir = reliability_test_dir("eagle-copy-path");
+        let library_item = dir.join("中文 图片.info");
+        fs::create_dir(&library_item).unwrap();
+        let source = library_item.join("原图 # 01.png");
+        fs::write(&source, b"original-image-bytes").unwrap();
+        let mixed = PathBuf::from(format!("{}/原图 # 01.png", library_item.display()));
+        assert!(mixed.is_file(), "Win32 filesystem lookup accepts this Eagle-style path");
+        unsafe {
+            let init = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            assert!(init.is_ok());
+            let result = shell_item_from_path(&mixed).map(drop);
+            if init == S_OK { CoUninitialize(); }
+            assert!(result.is_ok(), "Eagle-style Shell source: {:?}", result.err());
+        }
+        // Also use a mixed-separator destination: both Shell parsing boundaries
+        // need normalization, while completion callbacks retain exact undo paths.
+        let target = dir.join("destination");
+        fs::create_dir(&target).unwrap();
+        let mixed_target = PathBuf::from(format!("{}/destination", dir.display()));
+        let copied = copy_conflict::perform_user_transfer(ShellOperationKind::Copy, &[mixed], &mixed_target);
+        assert!(copied.result.is_ok(), "{:?}", copied.result);
+        assert_eq!(copied.copied.len(), 1);
+        assert_eq!(fs::read(&copied.copied[0]).unwrap(), b"original-image-bytes");
+        let undone = undo_copied_items(copied.copied);
+        assert_eq!(undone.restored, 1, "{:?}", undone.errors);
+        assert_eq!(fs::read(&source).unwrap(), b"original-image-bytes");
+        assert!(fs::read_dir(target).unwrap().next().is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires FILEFLOW_EAGLE_TEST_SOURCE captured from the Eagle CF_HDROP file list"]
+    fn copies_real_eagle_file_without_modifying_source() {
+        let captured = PathBuf::from(std::env::var_os("FILEFLOW_EAGLE_TEST_SOURCE").expect("captured Eagle file path"));
+        let expected = normalize_shell_path(&captured);
+        let files = vec![captured];
+        let original = fs::read(&expected).unwrap();
+        let dir = reliability_test_dir("eagle-live-copy");
+        let result = copy_conflict::perform_user_transfer(ShellOperationKind::Copy, &files, &dir);
+        assert!(result.result.is_ok(), "{:?}", result.result);
+        assert_eq!(result.copied.len(), 1);
+        assert_eq!(fs::read(&result.copied[0]).unwrap(), original);
+        assert_eq!(fs::read(&expected).unwrap(), original);
+        let undone = undo_copied_items(result.copied);
+        assert_eq!(undone.restored, 1, "{:?}", undone.errors);
+        assert!(undone.remaining.is_none());
+        assert_eq!(fs::read(expected).unwrap(), original);
+        assert!(fs::read_dir(&dir).unwrap().next().is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn shell_separator_normalization_preserves_unc_names_and_utf16() {
+        assert_eq!(normalize_shell_path(Path::new("E:/Eagle.library/images/id.info/原图 # 01.png")), PathBuf::from(r"E:\Eagle.library\images\id.info\原图 # 01.png"));
+        assert_eq!(normalize_shell_path(Path::new("//server/share/中文 目录/image.png")), PathBuf::from(r"\\server\share\中文 目录\image.png"));
+        assert_eq!(normalize_shell_path(Path::new(r"\\?\UNC\server\share\image.png")), PathBuf::from(r"\\?\UNC\server\share\image.png"));
+        let original = std::ffi::OsString::from_wide(&[b'E' as u16, b':' as u16, b'/' as u16, 0xd800, b'#' as u16]);
+        let path = normalize_shell_path(Path::new(&original));
+        assert_eq!(path.as_os_str().encode_wide().collect::<Vec<_>>(), vec![b'E' as u16, b':' as u16, b'\\' as u16, 0xd800, b'#' as u16]);
     }
 
     #[test]
