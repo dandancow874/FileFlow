@@ -1,7 +1,9 @@
 //! FileFlow 的传输撤销记录来自 Shell 完成回调，不能用“目标目录 + 原名”猜测。
 use super::{ShellOperationKind, UndoEntry, perform_shell_file_operation};
-use std::os::windows::ffi::OsStringExt;
-use std::path::PathBuf;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::AsRawHandle;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
@@ -159,12 +161,95 @@ pub(super) fn undo_copied_items(paths: Vec<PathBuf>) -> UndoResult {
 pub(super) fn undo_renamed_items(mut items: Vec<MoveRecord>) -> UndoResult {
     // 反向执行才能先释放后续重命名占用的原路径；不用中间临时名，失败不丢文件。
     items.reverse();
-    let mut outcome = undo_moved_items(items);
-    if let Some(UndoEntry::Move(mut remaining)) = outcome.remaining.take() {
-        remaining.reverse();
-        outcome.remaining = Some(UndoEntry::RenameBatch(remaining));
+    let mut restored = 0;
+    let mut remaining = Vec::new();
+    let mut errors = Vec::new();
+    for item in items {
+        match rename_without_overwrite(&item.from, &item.to) {
+            Ok(()) => restored += 1,
+            Err(error) => {
+                errors.push(format!("无法恢复名称 {}：{error}", item.to.display()));
+                remaining.push(item);
+            }
+        }
     }
-    outcome
+    remaining.reverse();
+    UndoResult {
+        restored,
+        remaining: (!remaining.is_empty()).then_some(UndoEntry::RenameBatch(remaining)),
+        errors,
+    }
+}
+
+/// Let Windows distinguish a case-only rename from a different occupied entry.
+/// Do not preflight destination.exists(): `poe` and `POE` resolve to the same entry
+/// in ordinary Windows directories. Flags 0 forbid replacing another entry,
+/// including one created after we start, without any intermediate temporary name.
+pub(super) fn rename_without_overwrite(from: &Path, to: &Path) -> std::io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+    if from == to {
+        return std::fs::symlink_metadata(from).map(|_| ());
+    }
+    match std::fs::symlink_metadata(to) {
+        Ok(_) => {
+            // Compare normalized ENTRY paths, not file IDs or followed symlink
+            // targets: two hard links / symlinks are still distinct occupied names.
+            if rename_entry_path(from)? != rename_entry_path(to)? {
+                return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "同名文件或文件夹已经存在"));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let wide_path = |path: &Path| -> std::io::Result<Vec<u16>> {
+        let name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "名称无效")
+        })?;
+        let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        // Extended canonical parents preserve long/UNC paths; retain the requested
+        // leaf spelling so a rename can actually change its stored capitalization.
+        let mut wide: Vec<_> = std::fs::canonicalize(parent)?.join(name).as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "名称含空字符"));
+        }
+        wide.push(0);
+        Ok(wide)
+    };
+    let from = wide_path(from)?;
+    let to = wide_path(to)?;
+    // SAFETY: both pointers reference live, NUL-terminated UTF-16 buffers.
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn rename_entry_path(path: &Path) -> std::io::Result<Vec<u16>> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFinalPathNameByHandleW,
+    };
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let mut buffer = vec![0u16; 512];
+    loop {
+        // SAFETY: the file handle and writable buffer stay live for this call.
+        let length = unsafe {
+            GetFinalPathNameByHandleW(file.as_raw_handle(), buffer.as_mut_ptr(), buffer.len() as u32, 0)
+        };
+        if length == 0 { return Err(std::io::Error::last_os_error()); }
+        if (length as usize) < buffer.len() {
+            buffer.truncate(length as usize);
+            return Ok(buffer);
+        }
+        buffer.resize(length as usize + 1, 0);
+    }
 }
 
 pub(super) fn undo_new_items(paths: Vec<PathBuf>) -> UndoResult {

@@ -4,7 +4,7 @@ mod text_input;
 mod transfer_undo;
 mod video_preview;
 mod copy_conflict;
-use transfer_undo::{TransferProgress, MoveRecord, ShellOperationResult, undo_moved_items, undo_copied_items, undo_new_items, undo_renamed_items};
+use transfer_undo::{TransferProgress, MoveRecord, ShellOperationResult, rename_without_overwrite, undo_moved_items, undo_copied_items, undo_new_items, undo_renamed_items};
 
 use chrono::{DateTime, Local};
 use gpui::StatefulInteractiveElement;
@@ -2510,14 +2510,12 @@ impl FileFlowGpui {
                 operation.and_then(|(target, new_path)| {
                     if new_name.is_empty() {
                         Err("名称不能为空".to_string())
-                    } else if target == new_path {
-                        Ok(new_path)
-                    } else if new_path.exists() {
-                        Err("同名文件或文件夹已经存在".to_string())
                     } else {
-                        fs::rename(&target, &new_path)
+                        rename_without_overwrite(&target, &new_path)
                             .map(|_| new_path)
-                            .map_err(|error| error.to_string())
+                            .map_err(|error| if error.kind() == std::io::ErrorKind::AlreadyExists {
+                                "同名文件或文件夹已经存在".to_string()
+                            } else { error.to_string() })
                     }
                 })
             });
@@ -8871,14 +8869,7 @@ fn batch_rename_files(
         if new_path == *target {
             continue;
         }
-        if new_path.exists() {
-            errors.push(format!(
-                "已存在同名文件：{}",
-                new_path.file_name().unwrap_or_default().to_string_lossy()
-            ));
-            continue;
-        }
-        match fs::rename(target, &new_path) {
+        match rename_without_overwrite(target, &new_path) {
             Ok(()) => renamed.push(MoveRecord { from: new_path, to: target.clone() }),
             Err(error) => errors.push(format!(
                 "{}：{error}",
@@ -12601,7 +12592,7 @@ fn main() {
     }
     trim_thumbnail_cache();
     // 部署验证标记：升级后看 integration.log 是否出现本行即可确认运行的是新构建
-    integration_log("startup build 2026-10-12 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 maximize-v1 ime-selection-v1 internal-drag-v1 transfer-undo-v1 reliability-v1 alt-tab-drag-v1 folder-covers-v1 disk-capacity-v1 exe-icons-v1 native-video-preview-v1 copy-move-conflicts-v1 overwrite-appdata-v1 title-controls-v1");
+    integration_log("startup build 2026-10-13 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 maximize-v1 ime-selection-v1 internal-drag-v1 transfer-undo-v1 reliability-v1 alt-tab-drag-v1 folder-covers-v1 disk-capacity-v1 exe-icons-v1 native-video-preview-v1 copy-move-conflicts-v1 overwrite-appdata-v1 title-controls-v1 case-rename-v1");
     let thumbnail_result_rx = start_thumbnail_worker();
     let folder_preview_rx = start_folder_preview_worker();
     let drive_info_rx = start_drive_info_worker();
@@ -13037,6 +13028,81 @@ mod tests {
             std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn case_only_renames_and_undo_preserve_files_and_folders() {
+        let dir = reliability_test_dir("case-rename");
+        let stored_names = || -> Vec<std::ffi::OsString> {
+            fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().file_name()).collect()
+        };
+        for (old, new, folder) in [
+            ("poe", "POE", true),
+            ("notes.txt", "NOTES.TXT", false),
+            ("中文_ä.txt", "中文_Ä.TXT", false),
+        ] {
+            let from = dir.join(old);
+            let to = dir.join(new);
+            if folder {
+                fs::create_dir(&from).unwrap();
+                fs::write(from.join("child.txt"), b"keep-folder-content").unwrap();
+            } else {
+                fs::write(&from, b"keep-file-content").unwrap();
+            }
+            // This is the old bug: exists() reports true even though this is the
+            // source itself. Inspect directory entries to verify actual stored case.
+            assert_ne!(from, to);
+            assert!(to.exists(), "fixture must use a case-insensitive directory");
+            rename_without_overwrite(&from, &to).unwrap();
+            assert!(stored_names().contains(&new.into()));
+            assert!(!stored_names().contains(&old.into()));
+            let content = if folder { to.join("child.txt") } else { to.clone() };
+            assert_eq!(fs::read(content).unwrap(), if folder { b"keep-folder-content".as_slice() } else { b"keep-file-content".as_slice() });
+            let undone = undo_renamed_items(vec![MoveRecord { from: to, to: from.clone() }]);
+            assert_eq!(undone.restored, 1, "{:?}", undone.errors);
+            assert!(undone.remaining.is_none());
+            assert!(stored_names().contains(&old.into()));
+            assert!(!stored_names().contains(&new.into()));
+        }
+        let from = dir.join("poe_001.txt");
+        fs::write(&from, b"batch-content").unwrap();
+        let (renamed, errors) = batch_rename_files(std::slice::from_ref(&from), "POE", 1);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(renamed.len(), 1);
+        assert!(stored_names().contains(&"POE_001.txt".into()));
+        let undone = undo_renamed_items(renamed);
+        assert_eq!(undone.restored, 1, "{:?}", undone.errors);
+        assert!(stored_names().contains(&"poe_001.txt".into()));
+        assert_eq!(fs::read(from).unwrap(), b"batch-content");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rename_conflicts_never_replace_existing_files_or_folders() {
+        let dir = reliability_test_dir("rename-conflicts");
+        let source = dir.join("source.txt");
+        let target = dir.join("POE.txt");
+        fs::write(&source, b"keep-source").unwrap();
+        fs::write(&target, b"keep-target").unwrap();
+        assert!(rename_without_overwrite(&source, &dir.join("poe.txt")).is_err());
+        assert_eq!(fs::read(&source).unwrap(), b"keep-source");
+        assert_eq!(fs::read(&target).unwrap(), b"keep-target");
+        let link = dir.join("alias.txt");
+        fs::hard_link(&source, &link).unwrap();
+        assert!(rename_without_overwrite(&source, &link).is_err());
+        assert_eq!(fs::read(&source).unwrap(), b"keep-source");
+        assert_eq!(fs::read(&link).unwrap(), b"keep-source");
+        let source_folder = dir.join("source-folder");
+        let target_folder = dir.join("POE");
+        fs::create_dir(&source_folder).unwrap();
+        fs::create_dir(&target_folder).unwrap();
+        fs::write(source_folder.join("source.txt"), b"keep-source").unwrap();
+        fs::write(target_folder.join("target.txt"), b"keep-target").unwrap();
+        assert!(rename_without_overwrite(&source_folder, &dir.join("poe")).is_err());
+        assert_eq!(fs::read(source_folder.join("source.txt")).unwrap(), b"keep-source");
+        assert_eq!(fs::read(target_folder.join("target.txt")).unwrap(), b"keep-target");
+        assert!(rename_without_overwrite(&dir.join("missing"), &dir.join("MISSING")).is_err());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
