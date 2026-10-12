@@ -4,6 +4,7 @@ mod text_input;
 mod transfer_undo;
 mod video_preview;
 mod copy_conflict;
+mod integration_path;
 use transfer_undo::{TransferProgress, MoveRecord, ShellOperationResult, rename_without_overwrite, undo_moved_items, undo_copied_items, undo_new_items, undo_renamed_items};
 
 use chrono::{DateTime, Local};
@@ -7394,6 +7395,10 @@ impl Render for FileFlowGpui {
         self.sync_video_preview(cx);
         let left_path = self.current_path().to_path_buf();
         let right_path = self.right_path.clone();
+        integration_path::publish(
+            cached_or_find_fileflow_hwnd() as usize,
+            integration_path::active_directory(&left_path, &right_path, self.split, self.active_side),
+        );
         let left_query = self.filter_input.read(cx).value();
         let right_query = self.right_filter_input.read(cx).value();
         let left_entries = self.arranged_entries(&self.left_entries, &left_query, "left");
@@ -9988,11 +9993,16 @@ fn start_external_command_listener() -> async_channel::Receiver<ExternalCommand>
             let Ok(mut stream) = stream else {
                 continue;
             };
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(750)));
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(750)));
             let mut buffer = String::new();
-            if stream.read_to_string(&mut buffer).is_ok()
-                && let Some(command) = parse_external_command(&buffer)
-            {
-                let _ = tx.send_blocking(command);
+            if std::io::Read::by_ref(&mut stream).take(65_537).read_to_string(&mut buffer).is_ok()
+                && buffer.len() <= 65_536 {
+                if let Some(response) = integration_path::response(&buffer) {
+                    let _ = stream.write_all(response.as_bytes());
+                } else if let Some(command) = parse_external_command(&buffer) {
+                    let _ = tx.send_blocking(command);
+                }
             }
         }
     });

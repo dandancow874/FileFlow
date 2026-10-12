@@ -1,0 +1,14 @@
+{
+  "ManifestVersion": 1,
+  "Id": "FileFlow",
+  "PluginType": "FileAppPlugin",
+  "PluginVersion": "0.1.0",
+  "DisplayName": "FileFlow",
+  "Authors": ["FileFlow"],
+  "Description": "Use the active FileFlow pane as a source for Listary Quick Switch.",
+  "Homepage": "https://github.com/dandancow874/FileFlow",
+  "Icon": "Icon.png",
+  "Api": "NetFramework",
+  "ApiVersion": 1,
+  "Entry": "Listary.FileAppPlugin.FileFlow.dll"
+}

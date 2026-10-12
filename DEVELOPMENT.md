@@ -166,6 +166,8 @@ C:\Users\Administrator\FileFlow\target\release\fileflow.exe
 
 ## 重要行为说明
 
+- Listary 6 Quick Switch 通过 `integrations/listary` 的官方 FileAppPlugin 接入。`src/integration_path.rs` 发布当前活动栏/标签的只读目录快照，现有本机 TCP 通道响应版本化查询，后台查询不调用 GPUI、不激活或导航窗口。安装脚本备份 Listary 配置，只启用 FileFlow 目录来源，并关闭插件在 FileFlow 中的键入搜索与鼠标接管；双栏按活动栏返回路径，虚拟页面返回空值。
+
 - Eagle 等程序的 CF_HDROP 文件列表可能混用正反斜杠（如 `E:\library\item.info/image.png`）。剪贴板读取与 Shell 文件项/剪贴板对象解析入口统一为反斜杠，保留原始 UTF-16 名称，避免 Shell 返回 `0x80070057`；仍使用原生复制和实际完成路径记录撤销。
 
 - 标题栏的最小化、最大化、关闭按钮固定在最右侧，顺序为 `− / □ / ×`，与新建标签按钮垂直居中。“＋”紧跟各栏最后一个标签，属于标签滚动区；窗口变窄或双栏标签过多时，只有标签区横向滚动，不挤压窗口按钮。
