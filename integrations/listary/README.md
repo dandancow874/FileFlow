@@ -16,11 +16,15 @@
 
 脚本使用已安装的 Listary SDK 编译插件，安装到 `C:\Program Files\Listary\FileAppPlugins\FileFlow`，备份并更新当前用户的 Listary 配置，然后重启原先运行中的 Listary。插件启用 Quick Switch 目录来源，关闭它在 FileFlow 中的即时键入搜索和鼠标双击/中键接管，以保留 FileFlow 的既有交互。其他配置保持原值。
 
+Windows 保护 `Program Files`，写入该安装目录需要管理员授权。脚本会在停止 Listary 前检查写入权限；如果由管理员进程安装，可传入 `-SkipRestart`，然后由原来的普通用户进程重新启动 Listary，避免改变它的运行权限。
+
 如果 Listary 安装在其他位置，传入 `-ListaryDirectory`。只有插件需要 .NET Framework，FileFlow 主程序仍是 Rust 原生程序。Listary 升级后如果自定义插件目录被移除，重新运行安装脚本。
 
 ## 验证
 
 Listary 设置的「集成」页面应显示并启用 FileFlow。真实验收须检查：左/右栏各自浏览目录、切换标签后进入文件选择窗口、中文/空格路径、关闭 FileFlow、虚拟页面，以及当前 Listary Quick Switch 设置。
+
+2026-10-13：在 Listary 6.3.6.99 上完成插件安装和配置核对，实际运行的 FileFlow 目录读取测试通过；用户反馈自动跳转已可用。独立测试文件窗口的自动验证未完成，不据此宣称所有文件选择窗口都已验证。
 
 FileFlow 的 TCP 查询请求为 `fileflow-query:current-directory:v1`，向 `127.0.0.1:47719` 发送 UTF-8 文本并关闭发送方向。响应为带 `version`、`window_handle`、`path` 的 JSON；插件核对窗口句柄，避免把其他窗口的目录当作当前目录。
 
