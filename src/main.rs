@@ -3510,8 +3510,8 @@ impl FileFlowGpui {
             div()
                 .id(id)
                 .w(px(46.))
-                .h(px(34.))
-                .mb(px(4.))
+                .h(px(42.))
+                .flex_shrink_0()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -3536,8 +3536,8 @@ impl FileFlowGpui {
             div()
                 .id(id)
                 .w(px(46.))
-                .h(px(34.))
-                .mb(px(4.))
+                .h(px(42.))
+                .flex_shrink_0()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -3546,6 +3546,9 @@ impl FileFlowGpui {
                 .child(label)
         };
         div()
+            .w(px(138.))
+            .h(px(42.))
+            .flex_shrink_0()
             .flex()
             .items_center()
             .child(
@@ -3568,6 +3571,7 @@ impl FileFlowGpui {
             let active = index == self.active_tab;
             div()
                 .id(("tab", index))
+                .flex_shrink_0()
                 .flex()
                 .items_center()
                 .gap_2()
@@ -3597,14 +3601,18 @@ impl FileFlowGpui {
         });
         div()
             .h(px(42.))
+            .w_full()
+            .min_w(px(0.))
+            .flex_shrink_0()
             .pl_3()
             .flex()
-            .items_end()
+            .items_center()
             .gap_1()
             .bg(rgb(0xf0f2f4))
             .child(
                 div()
                     .id("open-settings")
+                    .flex_shrink_0()
                     .pb_2()
                     .text_color(rgb(BLUE))
                     .child("☰")
@@ -3612,32 +3620,51 @@ impl FileFlowGpui {
                         this.on_open_settings(&OpenSettings, window, cx)
                     })),
             )
-            .child(div().w(px(1.)).h(px(24.)).bg(rgb(0xd9dfe3)).mx_2())
-            .children(tabs)
+            .child(div().w(px(1.)).h(px(24.)).flex_shrink_0().bg(rgb(0xd9dfe3)).mx_2())
+            // Only tabs may overflow. Reserve the right edge for the fixed controls,
+            // including in a narrow split pane; otherwise the close button gets clipped.
             .child(
                 div()
-                    .id("new-tab")
-                    .px_3()
-                    .py_2()
-                    .mb(px(1.))
-                    .text_color(rgb(MUTED))
-                    .child("＋")
-                    .on_click(cx.listener(|this, _, _, cx| this.add_tab(cx))),
-            )
-            .child(
-                div()
-                    .id("tabbar-drag-left")
+                    .id("tabs-left-strip")
                     .flex_1()
+                    .min_w(px(0.))
                     .h_full()
-                    .min_h(px(42.))
-                    .window_control_area(WindowControlArea::Drag),
+                    .flex()
+                    .items_end()
+                    .gap_1()
+                    .overflow_x_scroll()
+                    .children(tabs)
+                    .child(
+                        div()
+                            .id("new-tab")
+                            .w(px(38.))
+                            .h_full()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(rgb(MUTED))
+                            .child("＋")
+                            .on_click(cx.listener(|this, _, _, cx| this.add_tab(cx))),
+                    )
+                    .child(
+                        div()
+                            .id("tabbar-drag-left")
+                            .flex_1()
+                            .min_w(px(24.))
+                            .h_full()
+                            .window_control_area(WindowControlArea::Drag),
+                    ),
             )
             .child(
                 div()
                     .id("split")
-                    .px_2()
-                    .py_2()
-                    .mb(px(1.))
+                    .w(px(32.))
+                    .h_full()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .text_color(rgb(if self.split { BLUE } else { MUTED }))
                     .child("▥")
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_split(cx))),
@@ -3653,6 +3680,7 @@ impl FileFlowGpui {
             let active = index == self.right_active_tab;
             div()
                 .id(("right-tab", index))
+                .flex_shrink_0()
                 .flex()
                 .items_center()
                 .gap_2()
@@ -3682,31 +3710,48 @@ impl FileFlowGpui {
         });
         div()
             .h(px(42.))
+            .w_full()
+            .min_w(px(0.))
+            .flex_shrink_0()
             .pl_2()
             .flex()
-            .items_end()
+            .items_center()
             .gap_1()
             .bg(rgb(0xf0f2f4))
             .border_b_1()
             .border_color(rgb(0xd9dfe3))
-            .children(tabs)
             .child(
                 div()
-                    .id("new-right-tab")
-                    .px_3()
-                    .py_2()
-                    .mb(px(1.))
-                    .text_color(rgb(MUTED))
-                    .child("＋")
-                    .on_click(cx.listener(|this, _, _, cx| this.add_right_tab(cx))),
-            )
-            .child(
-                div()
-                    .id("tabbar-drag-right")
+                    .id("tabs-right-strip")
                     .flex_1()
+                    .min_w(px(0.))
                     .h_full()
-                    .min_h(px(42.))
-                    .window_control_area(WindowControlArea::Drag),
+                    .flex()
+                    .items_end()
+                    .gap_1()
+                    .overflow_x_scroll()
+                    .children(tabs)
+                    .child(
+                        div()
+                            .id("new-right-tab")
+                            .w(px(38.))
+                            .h_full()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(rgb(MUTED))
+                            .child("＋")
+                            .on_click(cx.listener(|this, _, _, cx| this.add_right_tab(cx))),
+                    )
+                    .child(
+                        div()
+                            .id("tabbar-drag-right")
+                            .flex_1()
+                            .min_w(px(24.))
+                            .h_full()
+                            .window_control_area(WindowControlArea::Drag),
+                    ),
             )
             .when(show_window_buttons, |bar| {
                 bar.child(self.window_buttons(cx))
@@ -12556,7 +12601,7 @@ fn main() {
     }
     trim_thumbnail_cache();
     // 部署验证标记：升级后看 integration.log 是否出现本行即可确认运行的是新构建
-    integration_log("startup build 2026-10-11 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 maximize-v1 ime-selection-v1 internal-drag-v1 transfer-undo-v1 reliability-v1 alt-tab-drag-v1 folder-covers-v1 disk-capacity-v1 exe-icons-v1 native-video-preview-v1 copy-move-conflicts-v1 overwrite-appdata-v1");
+    integration_log("startup build 2026-10-12 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 maximize-v1 ime-selection-v1 internal-drag-v1 transfer-undo-v1 reliability-v1 alt-tab-drag-v1 folder-covers-v1 disk-capacity-v1 exe-icons-v1 native-video-preview-v1 copy-move-conflicts-v1 overwrite-appdata-v1 title-controls-v1");
     let thumbnail_result_rx = start_thumbnail_worker();
     let folder_preview_rx = start_folder_preview_worker();
     let drive_info_rx = start_drive_info_worker();
