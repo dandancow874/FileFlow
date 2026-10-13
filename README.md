@@ -9,7 +9,7 @@ Windows 文件管理器，Rust + [gpui](https://github.com/zed-industries/zed)�
 - **双栏分屏**浏览，标签页，前进/后退历史
 - **六种视图**：详情 / 列表 / 分栏 / 中·大·超大图标
 - **全视图虚拟化渲染**——上万文件的目录依然流畅滚动（uniform_list）
-- 文件夹大小**后台异步计算**并显示
+- 文件夹大小**后台异步计算**并显示，大小排序使用内容总大小；计算完成后自动重排
 - 图片 / 视频**缩略图**（image crate 直解 + Windows Shell 管线覆盖 heic/psd 等）
 - 中 / 大 / 超大图标视图下，文件夹显示内部第一张图片的缩略图
 - 系统文件关联图标；EXE 与快捷方式按文件路径读取各自的图标
@@ -24,6 +24,10 @@ Windows 文件管理器，Rust + [gpui](https://github.com/zed-industries/zed)�
 - 右键菜单合并 **Windows Shell 原生菜单**（第三方扩展可用）
 - Win+E 接管（可选）、系统托盘、单实例
 - 标题栏拖动窗口、双击最大化/还原
+- 标签区独立滚动，窗口按钮保持最右侧；新建标签“＋”紧跟最后一个标签
+- 支持仅修改名称大小写（如 `poe → POE`）及撤销
+- 兼容 Eagle 等程序传出的混合分隔符剪贴板文件路径
+- 可选 [Listary Quick Switch 插件](integrations/listary/README.md)：文件选择窗口跟随 FileFlow 当前活动栏目录
 - 网络邻居（SMB 共享浏览）
 
 ## 下载
