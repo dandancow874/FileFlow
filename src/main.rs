@@ -1300,7 +1300,7 @@ impl FileFlowGpui {
                     .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             }),
         }
-        let folder_sizes = if sort_column == SortColumn::Size {
+        let folder_sizes = if sort_column == SortColumn::Size && !self.is_this_pc_side(side) {
             folder_sizes_for_sort(&result)
         } else { HashMap::new() };
         sort_entries(&mut result, self.folder_order, sort_column, sort_ascending, &folder_sizes);
