@@ -173,8 +173,9 @@ struct FolderPreview {
 }
 /// 文件夹递归大小缓存（后台算完写入，渲染零 IO）
 static FOLDER_SIZE_CACHE: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
-/// 文件夹大小计算请求通道（去重由 worker 侧 pending 集合保证）
+/// 文件夹大小计算请求通道；入队时去重，避免重绘反复排队同一目录。
 static FOLDER_SIZE_TX: OnceLock<async_channel::Sender<PathBuf>> = OnceLock::new();
+static FOLDER_SIZE_PENDING: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 /// 文件夹大小计算完成通知（触发 UI 刷新）
 static FOLDER_SIZE_DONE_TX: OnceLock<async_channel::Sender<PathBuf>> = OnceLock::new();
 static THUMBNAIL_PENDING: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
@@ -1299,21 +1300,10 @@ impl FileFlowGpui {
                     .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             }),
         }
-        result.sort_by(|a, b| {
-            let folder_group = match self.folder_order {
-                FolderOrder::FoldersFirst => b.is_dir.cmp(&a.is_dir),
-                FolderOrder::FilesFirst => a.is_dir.cmp(&b.is_dir),
-                _ => Ordering::Equal,
-            };
-            let column_order = compare_entries(a, b, sort_column);
-            folder_group.then_with(|| {
-                if sort_ascending {
-                    column_order
-                } else {
-                    column_order.reverse()
-                }
-            })
-        });
+        let folder_sizes = if sort_column == SortColumn::Size {
+            folder_sizes_for_sort(&result)
+        } else { HashMap::new() };
+        sort_entries(&mut result, self.folder_order, sort_column, sort_ascending, &folder_sizes);
         result
     }
 
@@ -9413,18 +9403,16 @@ fn start_folder_size_worker() -> async_channel::Receiver<PathBuf> {
     let done_tx_clone = done_tx.clone();
     let _ = FOLDER_SIZE_DONE_TX.set(done_tx_clone);
     thread::spawn(move || {
-        let mut inflight: HashSet<PathBuf> = HashSet::new();
         while let Ok(dir) = req_rx.recv_blocking() {
-            if !inflight.insert(dir.clone()) {
-                continue; // 已在算
-            }
             let total = recursive_dir_size(&dir, 0);
             FOLDER_SIZE_CACHE
                 .get_or_init(|| Mutex::new(HashMap::new()))
                 .lock()
                 .map(|mut cache| cache.insert(dir.clone(), total))
                 .ok();
-            inflight.remove(&dir);
+            if let Ok(mut pending) = FOLDER_SIZE_PENDING.get_or_init(|| Mutex::new(HashSet::new())).lock() {
+                pending.remove(&dir);
+            }
             let _ = done_tx.send_blocking(dir);
         }
     });
@@ -9452,6 +9440,30 @@ fn recursive_dir_size(dir: &Path, depth: usize) -> u64 {
     total
 }
 
+/// Snapshot totals once per sort. Request all filtered folders asynchronously,
+/// including those outside the viewport; visible rows alone cannot define a sort.
+fn folder_sizes_for_sort(entries: &[Entry]) -> HashMap<PathBuf, u64> {
+    let cache = FOLDER_SIZE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let sizes = cache.lock().map(|cache| entries.iter().filter(|entry| entry.is_dir)
+        .filter_map(|entry| cache.get(&entry.path).map(|&size| (entry.path.clone(), size)))
+        .collect::<HashMap<_, _>>()).unwrap_or_default();
+    for entry in entries.iter().filter(|entry| entry.is_dir && !sizes.contains_key(&entry.path)) {
+        let _ = folder_size_or_request(&entry.path);
+    }
+    sizes
+}
+
+fn queue_folder_size(dir: &Path, tx: &async_channel::Sender<PathBuf>, pending: &Mutex<HashSet<PathBuf>>) -> bool {
+    let Ok(mut pending) = pending.lock() else { return false; };
+    if !pending.insert(dir.to_path_buf()) { return false; }
+    if tx.try_send(dir.to_path_buf()).is_err() {
+        // A full queue must not leave a permanent pending mark: retry on repaint.
+        pending.remove(dir);
+        return false;
+    }
+    true
+}
+
 /// 渲染用：文件夹大小（缓存命中返回 Some；未命中投递后台计算并返回 None）
 fn folder_size_or_request(dir: &Path) -> Option<u64> {
     let cache = FOLDER_SIZE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -9461,7 +9473,8 @@ fn folder_size_or_request(dir: &Path) -> Option<u64> {
         return Some(*size);
     }
     if let Some(tx) = FOLDER_SIZE_TX.get() {
-        let _ = tx.try_send(dir.to_path_buf());
+        let pending = FOLDER_SIZE_PENDING.get_or_init(|| Mutex::new(HashSet::new()));
+        let _ = queue_folder_size(dir, tx, pending);
     }
     None
 }
@@ -10718,6 +10731,39 @@ fn delete_reg_tree(subkey: &str) -> bool {
         let _ = RegCloseKey(key);
         ok
     }
+}
+
+fn sort_entries(
+    entries: &mut [Entry],
+    folder_order: FolderOrder,
+    column: SortColumn,
+    ascending: bool,
+    folder_sizes: &HashMap<PathBuf, u64>,
+) {
+    entries.sort_by(|a, b| {
+        let group = match folder_order {
+            FolderOrder::FoldersFirst => b.is_dir.cmp(&a.is_dir),
+            FolderOrder::FilesFirst => a.is_dir.cmp(&b.is_dir),
+            _ => Ordering::Equal,
+        };
+        group.then_with(|| {
+            let order = if column == SortColumn::Size {
+                let size = |entry: &Entry| if entry.is_dir {
+                    folder_sizes.get(&entry.path).copied()
+                } else { Some(entry.size) };
+                match (size(a), size(b)) {
+                    (Some(a_size), Some(b_size)) => a_size.cmp(&b_size)
+                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                    // Unknown totals stay last within their folder/file group in
+                    // either direction, instead of pretending that they're zero.
+                    (Some(_), None) => return Ordering::Less,
+                    (None, Some(_)) => return Ordering::Greater,
+                    (None, None) => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                }
+            } else { compare_entries(a, b, column) };
+            if ascending { order } else { order.reverse() }
+        })
+    });
 }
 
 fn compare_entries(a: &Entry, b: &Entry, column: SortColumn) -> Ordering {
@@ -12614,7 +12660,7 @@ fn main() {
     }
     trim_thumbnail_cache();
     // 部署验证标记：升级后看 integration.log 是否出现本行即可确认运行的是新构建
-    integration_log("startup build 2026-10-13 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 maximize-v1 ime-selection-v1 internal-drag-v1 transfer-undo-v1 reliability-v1 alt-tab-drag-v1 folder-covers-v1 disk-capacity-v1 exe-icons-v1 native-video-preview-v1 copy-move-conflicts-v1 overwrite-appdata-v1 title-controls-v1 case-rename-v1");
+    integration_log("startup build 2026-10-13 keyboard-nav-v1 external-new-tab-v1 reopen-tab-v1 maximize-v1 ime-selection-v1 internal-drag-v1 transfer-undo-v1 reliability-v1 alt-tab-drag-v1 folder-covers-v1 disk-capacity-v1 exe-icons-v1 native-video-preview-v1 copy-move-conflicts-v1 overwrite-appdata-v1 title-controls-v1 case-rename-v1 eagle-clipboard-paths-v1 listary-quick-switch-v1 folder-size-sort-v1");
     let thumbnail_result_rx = start_thumbnail_worker();
     let folder_preview_rx = start_folder_preview_worker();
     let drive_info_rx = start_drive_info_worker();
@@ -13050,6 +13096,58 @@ mod tests {
             std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn folder_size_sort_matches_displayed_totals_and_reorders_when_ready() {
+        let entry = |name: &str, is_dir: bool, size: u64| Entry {
+            name: name.into(), path: PathBuf::from(format!(r"C:\size-sort-test\{name}")),
+            is_dir, size, modified: String::new(), modified_millis: 0,
+        };
+        let mut entries = vec![entry("a-small", true, 0), entry("b-large", true, 0), entry("c-kb", true, 0), entry("d-medium", true, 0)];
+        let mut sizes = HashMap::from([
+            (entries[0].path.clone(), 1_100_000),
+            (entries[1].path.clone(), 107_000_000),
+            (entries[2].path.clone(), 625_100),
+            (entries[3].path.clone(), 46_100_000),
+        ]);
+        sort_entries(&mut entries, FolderOrder::Mixed, SortColumn::Size, false, &sizes);
+        assert_eq!(entries.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(), ["b-large", "d-medium", "a-small", "c-kb"]);
+        sort_entries(&mut entries, FolderOrder::Mixed, SortColumn::Size, true, &sizes);
+        assert_eq!(entries.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(), ["c-kb", "a-small", "d-medium", "b-large"]);
+        let pending = entry("pending", true, 99_999_999); // Directory metadata is not its content total.
+        entries.push(pending.clone());
+        for ascending in [true, false] {
+            sort_entries(&mut entries, FolderOrder::Mixed, SortColumn::Size, ascending, &sizes);
+            assert_eq!(entries.last().unwrap().name, "pending");
+        }
+        sizes.insert(pending.path, 200_000_000);
+        sort_entries(&mut entries, FolderOrder::Mixed, SortColumn::Size, false, &sizes);
+        assert_eq!(entries.first().unwrap().name, "pending");
+        entries.push(entry("file.txt", false, 150_000_000));
+        sort_entries(&mut entries, FolderOrder::Mixed, SortColumn::Size, false, &sizes);
+        assert_eq!(entries.iter().take(3).map(|entry| entry.name.as_str()).collect::<Vec<_>>(), ["pending", "file.txt", "b-large"]);
+        sort_entries(&mut entries, FolderOrder::FoldersFirst, SortColumn::Size, false, &sizes);
+        assert!(!entries.last().unwrap().is_dir);
+        sort_entries(&mut entries, FolderOrder::FilesFirst, SortColumn::Size, true, &sizes);
+        assert!(!entries.first().unwrap().is_dir);
+    }
+
+    #[test]
+    fn folder_size_requests_are_deduplicated_and_retry_when_queue_is_full() {
+        let (tx, rx) = async_channel::bounded(1);
+        let pending = Mutex::new(HashSet::new());
+        let first = Path::new(r"C:\size-request-test\first");
+        let second = Path::new(r"C:\size-request-test\second");
+        assert!(queue_folder_size(first, &tx, &pending));
+        assert!(!queue_folder_size(first, &tx, &pending));
+        assert!(!queue_folder_size(second, &tx, &pending));
+        assert!(!pending.lock().unwrap().contains(second));
+        assert_eq!(rx.try_recv().unwrap(), first);
+        assert!(rx.try_recv().is_err());
+        pending.lock().unwrap().remove(first);
+        assert!(queue_folder_size(second, &tx, &pending));
+        assert_eq!(rx.try_recv().unwrap(), second);
     }
 
     #[test]

@@ -166,6 +166,8 @@ C:\Users\Administrator\FileFlow\target\release\fileflow.exe
 
 ## 重要行为说明
 
+- 大小排序与详情列使用同一份后台文件夹内容总大小缓存，不使用目录元数据长度。按大小排序时为筛选结果中的所有文件夹排后台计算（含未显示在视口中的项），计算完成触发重排；未知大小项在各自分组末尾等待，升降序均不冒充零字节。入队去重并对满队列允许重试，避免每次重绘重复扫描同一目录；保留文件夹/文件优先分组规则。
+
 - Listary 6 Quick Switch 通过 `integrations/listary` 的官方 FileAppPlugin 接入。`src/integration_path.rs` 发布当前活动栏/标签的只读目录快照，现有本机 TCP 通道响应版本化查询，后台查询不调用 GPUI、不激活或导航窗口。安装脚本备份 Listary 配置，只启用 FileFlow 目录来源，并关闭插件在 FileFlow 中的键入搜索与鼠标接管；双栏按活动栏返回路径，虚拟页面返回空值。
 
 - Eagle 等程序的 CF_HDROP 文件列表可能混用正反斜杠（如 `E:\library\item.info/image.png`）。剪贴板读取与 Shell 文件项/剪贴板对象解析入口统一为反斜杠，保留原始 UTF-16 名称，避免 Shell 返回 `0x80070057`；仍使用原生复制和实际完成路径记录撤销。
